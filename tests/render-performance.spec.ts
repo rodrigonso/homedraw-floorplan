@@ -20,7 +20,7 @@ async function beginNodeDrag(page: Page) {
   const start = await screenPoint(page, node);
   await page.mouse.move(start.x, start.y);
   await page.mouse.down();
-  await expect(page.getByRole("textbox", { name: "Wall length", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Delete node", exact: true })).toBeVisible();
   return { original, node };
 }
 
@@ -48,6 +48,8 @@ test("incremental conversion matches fresh geometry while preserving unaffected 
     const hidden = renderer.render(moved, false);
     renderer.clear();
     const refreshed = renderer.render(moved);
+    const merged = model.mergeNodes(moved, node.id, moved.nodes.find(node => node.x === 0 && node.y === 0)!.id);
+    const combined = renderer.render(merged);
     return {
       total: before.length,
       reused: after.filter(element => element === beforeById.get(element.id)).length,
@@ -57,6 +59,7 @@ test("incremental conversion matches fresh geometry while preserving unaffected 
       hiddenDimensions: hidden.filter(element => element.id.startsWith("plan-dim-")).length,
       refreshed: refreshed.map(clean),
       cleared: refreshed.every(element => element !== afterById.get(element.id)),
+      combined: combined.map(clean), expectedCombined: scene.planToElements(merged).map(clean),
     };
   });
   expect(result.reused).toBeGreaterThan(result.total * 0.85);
@@ -67,6 +70,7 @@ test("incremental conversion matches fresh geometry while preserving unaffected 
   expect(result.hiddenDimensions).toBe(0);
   expect(result.refreshed).toEqual(result.expected);
   expect(result.cleared).toBe(true);
+  expect(result.combined).toEqual(result.expectedCombined);
 });
 
 test("release before a queued preview commits the release coordinates exactly once", async ({ page }) => {

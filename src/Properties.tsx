@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftRight, Ruler, Trash2 } from "lucide-react";
+import { ArrowLeftRight, CirclePlus, Ruler, Trash2 } from "lucide-react";
 import {
-  deleteAngleDimension, deleteOpening, deleteWall, detectRooms, distance, formatArea, formatLength, isWallDegenerate,
-  parseAngle, parseLength, parsePosition, renameRoom, resizeAngle, resizeWall, setWallThickness, toggleDimension, updateAngleDimension, updateOpening, wallPoints,
-  type Plan,
+  deleteAngleDimension, deleteOpening, deleteThicknessDimension, deleteWall, detectRooms, distance, formatArea, formatLength, formatLengthInput, getNodeDeletionInfo, isWallDegenerate,
+  parseAngle, parseLength, parsePosition, renameRoom, resizeAngle, resizeWall, setWallThickness, splitWall, toggleDimension, updateAngleDimension, updateOpening, updateThicknessDimension, wallPoints,
+  type MeasurementSettings, type Plan,
 } from "./model";
 import type { Selection } from "./scene";
 import { anglePosition, formatAngle, formatAngleInput, hasAngleGeometry } from "./angles";
@@ -11,13 +11,13 @@ import { anglePosition, formatAngle, formatAngleInput, hasAngleGeometry } from "
 export type Commit = (change: (plan: Plan) => Plan) => boolean;
 
 export function LengthField({ label, value, units, onApply, disabled = false, position = false }: {
-  label: string; value: number; units: Plan["units"]; onApply: (value: number) => boolean | void;
+  label: string; value: number; units: MeasurementSettings; onApply: (value: number) => boolean | void;
   disabled?: boolean;
   position?: boolean;
 }) {
   const display = `${value < 0 ? "-" : ""}${formatLength(Math.abs(value), units)}`;
   return <MeasurementField label={label} value={value} onApply={onApply} disabled={disabled}
-    formatted={units === "metric" ? `${Number((value / 1000).toFixed(4))} m` : display}
+    formatted={formatLengthInput(value, units)}
     resetText={display} parse={text => position ? parsePosition(text, units) : parseLength(text, units)} />;
 }
 
@@ -43,6 +43,7 @@ function MeasurementField({ label, value, formatted, resetText = formatted, pars
         setError("Change not applied. See the error below.");
       } else {
         setEdited(false);
+        if (Math.abs(parsed - value) <= tolerance) setText(formatted);
       }
     } catch (error) {
       if (!(error instanceof Error)) throw error;
@@ -64,14 +65,47 @@ function MeasurementField({ label, value, formatted, resetText = formatted, pars
   </label>;
 }
 
-export default function Properties({ plan, selection, commit, clear }: {
-  plan: Plan; selection: Selection; commit: Commit; clear: () => void;
+export default function Properties({ plan, selection, commit, clear, onDeleteNode, onAddThickness }: {
+  plan: Plan; selection: Selection; commit: Commit; clear: () => void; onDeleteNode: (id: string) => void;
+  onAddThickness: (wallId: string) => void;
 }) {
+  const node = selection?.kind === "node" ? plan.nodes.find(node => node.id === selection.id) : undefined;
   const wall = selection?.kind === "wall" ? plan.walls.find(w => w.id === selection.id) : undefined;
   const opening = selection && ["door", "window"].includes(selection.kind)
     ? plan.openings.find(o => o.id === selection.id) : undefined;
   const room = selection?.kind === "room" ? detectRooms(plan).find(r => r.id === selection.id) : undefined;
   const angle = selection?.kind === "angle" ? plan.angleDimensions?.find(a => a.id === selection.id) : undefined;
+  const thickness = selection?.kind === "thickness" ? plan.thicknessDimensions?.find(dimension => dimension.id === selection.id) : undefined;
+  if (thickness) {
+    const host = plan.walls.find(wall => wall.id === thickness.wallId)!;
+    const collapsed = isWallDegenerate(plan, host);
+    return <>
+      <div className="section-heading"><span>Thickness measurement</span></div>
+      <LengthField label="Wall thickness" value={host.thickness} units={plan}
+        onApply={value => commit(p => setWallThickness(p, host.id, value))} />
+      <LengthField label="Offset from wall end" value={thickness.offset} units={plan} position disabled={collapsed}
+        onApply={offset => commit(p => updateThicknessDimension(p, thickness.id, { offset }))} />
+      <p className="helper">Measures the two wall faces. Thickness changes equally on either side of the centerline. Drag the label along the wall to reposition it; negative offsets place it before endpoint B.</p>
+      {collapsed && <p className="helper geometry-feedback">Move the junctions apart to restore this measurement's direction.</p>}
+      <button className="danger-button" onClick={() => {
+        if (commit(p => deleteThicknessDimension(p, thickness.id))) clear();
+      }}><Trash2 size={15} /> Delete thickness measurement</button>
+    </>;
+  }
+  if (node) {
+    const info = getNodeDeletionInfo(plan, node.id);
+    return <>
+      <div className="section-heading"><span>Node</span><span className="subtle">{info.wallCount} connected {info.wallCount === 1 ? "wall" : "walls"}</span></div>
+      <p className="helper">Drag to reshape walls; drop on another node to combine them. Shift locks an axis; Alt keeps nodes separate. Delete or Backspace removes this node.</p>
+      <p className="helper">{info.joinsWalls
+        ? "Deleting this node joins its two walls. Openings follow the joined wall."
+        : "Deleting this node removes its attached walls and their openings."}</p>
+      {info.removedAngles > 0 && <p className="helper">{info.removedAngles} attached angle {info.removedAngles === 1 ? "measurement will" : "measurements will"} be removed.</p>}
+      {info.removedThickness > 0 && <p className="helper">{info.removedThickness} thickness {info.removedThickness === 1 ? "measurement will" : "measurements will"} be removed.</p>}
+      {info.changesStyle && <p className="helper">The joined wall keeps the first wall's thickness and dimension position.</p>}
+      <button className="danger-button" onClick={() => onDeleteNode(node.id)}><Trash2 size={15} /> Delete node</button>
+    </>;
+  }
   if (angle && !hasAngleGeometry(plan, angle)) return <>
     <div className="section-heading"><span>Angle measurement</span></div>
     <p className="helper geometry-feedback">This angle is undefined while a connected wall is collapsed. Drag its junctions apart to restore the measurement.</p>
@@ -86,7 +120,7 @@ export default function Properties({ plan, selection, commit, clear }: {
     <MeasurementField key={angle.id} label="Angle" value={anglePosition(plan, angle).degrees}
       formatted={formatAngleInput(anglePosition(plan, angle).degrees)} parse={parseAngle} tolerance={1e-7}
       onApply={degrees => commit(p => resizeAngle(p, angle.id, degrees))} />
-    <LengthField label="Angle arc radius" value={angle.radius} units={plan.units}
+    <LengthField label="Angle arc radius" value={angle.radius} units={plan}
       onApply={radius => commit(p => updateAngleDimension(p, angle.id, { radius }))} />
     <button className="secondary-button full" onClick={() =>
       commit(p => updateAngleDimension(p, angle.id, { clockwise: !angle.clockwise }))}>
@@ -99,31 +133,39 @@ export default function Properties({ plan, selection, commit, clear }: {
   </>;
   if (wall) {
     const [a, b] = wallPoints(plan, wall);
+    const collapsed = isWallDegenerate(plan, wall);
     return <>
       <div className="section-heading"><span>Wall</span></div>
       <div className="wall-diagram"><span>A</span><div /><span>B</span></div>
-      <LengthField label="Wall length" value={distance(a, b)} units={plan.units} disabled={isWallDegenerate(plan, wall)}
+      <LengthField label="Wall length" value={distance(a, b)} units={plan} disabled={collapsed}
         onApply={value => commit(p => resizeWall(p, wall.id, value))} />
-      {isWallDegenerate(plan, wall) && <p className="helper geometry-feedback">Drag either junction apart to give this wall a direction again.</p>}
-      <LengthField label="Wall thickness" value={wall.thickness} units={plan.units}
+      {collapsed && <p className="helper geometry-feedback">Drag either junction apart to give this wall a direction again.</p>}
+      <LengthField label="Wall thickness" value={wall.thickness} units={plan}
         onApply={value => commit(p => setWallThickness(p, wall.id, value))} />
-      <p className="helper">A stays fixed. B and connected walls follow.</p>
+      <p className="helper">Length edits keep A fixed; B and connected walls follow. Thickness changes equally on both sides of the centerline.</p>
       <button className={`option-row ${wall.dimension ? "enabled" : ""}`}
         aria-pressed={wall.dimension}
         onClick={() => commit(p => toggleDimension(p, wall.id))}>
         <Ruler size={16} /> Attached dimension <span className="switch" />
       </button>
+      <button className="secondary-button full" disabled={collapsed} onClick={() => onAddThickness(wall.id)}>
+        <ArrowLeftRight size={16} /> Add thickness measurement
+      </button>
+      <button className="secondary-button full" disabled={collapsed}
+        onClick={() => commit(p => splitWall(p, wall.id, distance(...wallPoints(p, wall)) / 2))}>
+        <CirclePlus size={16} /> Add midpoint node
+      </button>
       <button className="danger-button" onClick={() => {
         if (commit(p => deleteWall(p, wall.id))) clear();
       }}><Trash2 size={15} /> Delete wall</button>
-      <details className="property-help"><summary>About this wall</summary><p>Length uses the wall centerline. Deleting a wall also removes its openings and angle measurements.</p></details>
+      <details className="property-help"><summary>About this wall</summary><p>Double-click a wall in Select mode to add a node at that position. Length uses the wall centerline. Deleting a wall also removes its openings, angles, and thickness measurements.</p></details>
     </>;
   }
   if (opening) return <>
     <div className="section-heading"><span>{opening.kind === "door" ? "Door" : "Window"}</span></div>
-    <LengthField label="Opening width" value={opening.width} units={plan.units}
+    <LengthField label="Opening width" value={opening.width} units={plan}
       onApply={value => commit(p => updateOpening(p, opening.id, { width: value }))} />
-    <LengthField label="Position from wall start" value={opening.offset} units={plan.units} position
+    <LengthField label="Position from wall start" value={opening.offset} units={plan} position
       onApply={value => commit(p => updateOpening(p, opening.id, { offset: value }))} />
     <p className="helper">Position is measured to the opening's center.</p>
     {opening.kind === "door" && <button className="secondary-button full" onClick={() =>
@@ -144,7 +186,7 @@ export default function Properties({ plan, selection, commit, clear }: {
           }
         }} onKeyDown={event => { if (event.key === "Enter") event.currentTarget.blur(); }} />
     </label>
-    <div className="area-card"><span>Enclosed area</span><strong>{formatArea(room.area, plan.units)}</strong>
+    <div className="area-card room-area"><span>Enclosed area</span><strong className="area-value">{formatArea(room.area, plan.units)}</strong>
       <small>Measured to wall centerlines</small></div>
     <p className="helper">Select a boundary wall to change the room's shape.</p>
   </>;

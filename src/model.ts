@@ -1,3 +1,8 @@
+import { evaluateMeasurement, type LengthUnit } from "./measurementExpression";
+
+export type { LengthUnit } from "./measurementExpression";
+export interface LengthUnits { metric: "m" | "cm"; imperial: "ft" | "in" }
+
 export interface Point { x: number; y: number }
 export interface Node extends Point { id: string }
 export interface Wall {
@@ -15,6 +20,7 @@ export interface Opening {
   offset: number;
   width: number;
   flip: boolean;
+  hingeAtEnd?: boolean;
 }
 export interface AngleDimension {
   id: string;
@@ -23,6 +29,12 @@ export interface AngleDimension {
   vertex: string;
   radius: number;
   clockwise: boolean;
+}
+export interface ThicknessDimension {
+  id: string;
+  wallId: string;
+  // Signed millimeters from endpoint B along the A-to-B direction.
+  offset: number;
 }
 export interface Room {
   id: string;
@@ -36,10 +48,12 @@ export interface Plan {
   version: 1;
   name: string;
   units: "metric" | "imperial";
+  lengthUnits?: LengthUnits;
   nodes: Node[];
   walls: Wall[];
   openings: Opening[];
   angleDimensions?: AngleDimension[];
+  thicknessDimensions?: ThicknessDimension[];
   roomNames: Record<string, string>;
 }
 
@@ -62,6 +76,8 @@ const MAX_NODES = 2_000;
 const MAX_WALLS = 1_000;
 const MAX_OPENINGS = 1_000;
 const MAX_ANGLE_DIMENSIONS = 1_000;
+const MAX_THICKNESS_DIMENSIONS = 1_000;
+export const DEFAULT_THICKNESS_DIMENSION_OFFSET = 350;
 const MAX_NAME = 120;
 const id = () => crypto.randomUUID();
 const dot = (a: Point, b: Point) => a.x * b.x + a.y * b.y;
@@ -98,6 +114,11 @@ function checkThickness(thickness: number): void {
 function checkLength(length: number): void {
   finite(length, "Wall length");
   ensure(length >= MIN_LENGTH, "Wall length must be at least 1 mm.");
+}
+
+function checkThicknessDimensionOffset(offset: unknown): asserts offset is number {
+  finite(offset, "Thickness measurement offset");
+  ensure(Math.abs(offset) <= MAX_COORDINATE, "Thickness measurement offset must be within 100 m of its wall end.");
 }
 
 export function createEmptyPlan(): Plan {
@@ -274,6 +295,13 @@ export function getGeometryIssues(plan: Plan): GeometryIssue[] {
   }));
 }
 
+export function constrainToAxis(point: Point, origin: Point): Point {
+  finite(point.x, "Position X"); finite(point.y, "Position Y");
+  finite(origin.x, "Origin X"); finite(origin.y, "Origin Y");
+  return Math.abs(point.x - origin.x) >= Math.abs(point.y - origin.y)
+    ? { x: point.x, y: origin.y } : { x: origin.x, y: point.y };
+}
+
 export function snapPoint(
   plan: Plan, point: Point, grid: number, threshold: number, origin?: Point, orthogonal = false,
 ): Point {
@@ -283,12 +311,8 @@ export function snapPoint(
   finite(threshold, "Snap distance");
   ensure(grid >= 0, "Grid spacing cannot be negative.");
   ensure(threshold >= 0, "Snap distance cannot be negative.");
-  const axis = orthogonal && origin
-    ? (Math.abs(point.x - origin.x) >= Math.abs(point.y - origin.y) ? "x" : "y")
-    : undefined;
-  const target = axis && origin
-    ? (axis === "x" ? { x: point.x, y: origin.y } : { x: origin.x, y: point.y })
-    : point;
+  const target = orthogonal && origin ? constrainToAxis(point, origin) : point;
+  const axis = orthogonal && origin ? (target.y === origin.y ? "x" : "y") : undefined;
   const onAxis = (candidate: Point) => !axis || !origin ||
     Math.abs(axis === "x" ? candidate.y - origin.y : candidate.x - origin.x) <= EPS;
   const constrain = (candidate: Point): Point => axis && origin
@@ -341,11 +365,16 @@ function findWall(plan: Plan, wallId: string): Wall {
   return wall;
 }
 
+function findSharedWallVertex(wallA: Wall, wallB: Wall): string | undefined {
+  const shared = [wallA.a, wallA.b].filter(nodeId => nodeId === wallB.a || nodeId === wallB.b);
+  return wallA.id !== wallB.id && shared.length === 1 ? shared[0] : undefined;
+}
+
 function sharedWallVertex(wallA: Wall, wallB: Wall): string {
   ensure(wallA.id !== wallB.id, "An angle dimension requires two different walls.");
-  const shared = [wallA.a, wallA.b].filter(nodeId => nodeId === wallB.a || nodeId === wallB.b);
-  ensure(shared.length === 1, "Angle dimension walls must share exactly one junction.");
-  return shared[0]!;
+  const vertex = findSharedWallVertex(wallA, wallB);
+  ensure(vertex, "Angle dimension walls must share exactly one junction.");
+  return vertex;
 }
 
 export function angleVertex(plan: Plan, wallA: string, wallB: string): Node {
@@ -359,6 +388,77 @@ function findOpening(plan: Plan, openingId: string): Opening {
   const opening = plan.openings.find(item => item.id === openingId);
   ensure(opening, "The selected opening no longer exists.");
   return opening;
+}
+
+function partitionWall(plan: Plan, wall: Wall, cuts: { node: Node; offset: number }[],
+  angleDimensions = plan.angleDimensions, thicknessDimensions = plan.thicknessDimensions) {
+  const walls: Wall[] = [];
+  const openings: Opening[] = [];
+  const attached = plan.openings.filter(opening => opening.wallId === wall.id);
+  if (cuts.length === 2) return { walls: [wall], openings: attached, angleDimensions, thicknessDimensions };
+  const thicknessUpdates = new Map<string, ThicknessDimension>();
+  const length = distance(...wallPoints(plan, wall));
+  for (let i = 0; i < cuts.length - 1; i++) {
+    const from = cuts[i]!;
+    const to = cuts[i + 1]!;
+    const segment = { ...wall, id: i === 0 ? wall.id : id(), a: from.node.id, b: to.node.id };
+    walls.push(segment);
+    // The original ID stays on the first segment; angles at the far end follow the last.
+    if (segment.id !== wall.id && to.node.id === wall.b) {
+      angleDimensions = angleDimensions?.map(dimension => dimension.vertex === wall.b
+        ? {
+          ...dimension,
+          wallA: dimension.wallA === wall.id ? segment.id : dimension.wallA,
+          wallB: dimension.wallB === wall.id ? segment.id : dimension.wallB,
+        } : dimension);
+    }
+    for (const opening of attached) {
+      if ((i === 0 || opening.offset >= from.offset) &&
+        (i === cuts.length - 2 || opening.offset < to.offset)) {
+        openings.push({ ...opening, wallId: segment.id, offset: opening.offset - from.offset });
+      }
+    }
+    for (const dimension of thicknessDimensions ?? []) {
+      if (dimension.wallId !== wall.id) continue;
+      const station = length + dimension.offset;
+      if ((i === 0 || station >= from.offset) && (i === cuts.length - 2 || station < to.offset)) {
+        thicknessUpdates.set(dimension.id, { ...dimension, wallId: segment.id, offset: dimension.offset + (length - to.offset) });
+      }
+    }
+  }
+  return { walls, openings, angleDimensions,
+    thicknessDimensions: thicknessDimensions?.map(dimension => thicknessUpdates.get(dimension.id) ?? dimension) };
+}
+
+export function splitWall(plan: Plan, wallId: string, offset: number): Plan {
+  const wall = findWall(plan, wallId);
+  const [a, b] = wallPoints(plan, wall);
+  const length = distance(a, b);
+  finite(offset, "Node position");
+  ensure(length >= MIN_LENGTH, "Move the wall's junctions apart before adding a node.");
+  ensure(offset > EPS && offset < length - EPS, "Place the new node between the wall's endpoints.");
+  const node: Node = { id: id(), ...interpolate(a, b, offset / length) };
+  const parts = partitionWall(plan, wall, [{ node: a, offset: 0 }, { node, offset }, { node: b, offset: length }]);
+  const openings = new Map(parts.openings.map(opening => [opening.id, opening]));
+  const roomNames = { ...plan.roomNames };
+  for (const room of Object.keys(roomNames).length ? detectRooms(plan) : []) {
+    if (!Object.hasOwn(roomNames, room.id)) continue;
+    const includesWall = room.nodeIds.some((from, i) => {
+      const to = room.nodeIds[(i + 1) % room.nodeIds.length];
+      return from === wall.a && to === wall.b || from === wall.b && to === wall.a;
+    });
+    if (includesWall) {
+      delete roomNames[room.id];
+      roomNames[`room:${[...new Set([...room.nodeIds, node.id])].sort().join(":")}`] = room.name;
+    }
+  }
+  return validatePlan({
+    ...plan, nodes: [...plan.nodes, node], roomNames,
+    walls: plan.walls.flatMap(item => item.id === wallId ? parts.walls : [item]),
+    openings: plan.openings.map(opening => openings.get(opening.id) ?? opening),
+    ...(Object.hasOwn(plan, "angleDimensions") ? { angleDimensions: parts.angleDimensions } : {}),
+    ...(Object.hasOwn(plan, "thicknessDimensions") ? { thicknessDimensions: parts.thicknessDimensions } : {}),
+  });
 }
 
 function insertWall(plan: Plan, start: Point, end: Point, thickness: number, reuseBoundary: boolean): Plan {
@@ -383,6 +483,7 @@ function insertWall(plan: Plan, start: Point, end: Point, thickness: number, reu
   const walls: Wall[] = [];
   const openingUpdates = new Map<string, Opening>();
   let angleDimensions = plan.angleDimensions;
+  let thicknessDimensions = plan.thicknessDimensions;
   for (const wall of plan.walls) {
     const [c, d] = wallPoints(plan, wall);
     const wallLength = distance(c, d);
@@ -404,28 +505,11 @@ function insertWall(plan: Plan, start: Point, end: Point, thickness: number, reu
       }
     }
     cuts.sort((left, right) => left.offset - right.offset);
-    const attached = plan.openings.filter(opening => opening.wallId === wall.id);
-    for (let i = 0; i < cuts.length - 1; i++) {
-      const from = cuts[i]!;
-      const to = cuts[i + 1]!;
-      const segment = { ...wall, id: i === 0 ? wall.id : id(), a: from.node.id, b: to.node.id };
-      walls.push(segment);
-      // The original ID stays on the first segment; angles at the far end follow the last.
-      if (segment.id !== wall.id && to.node.id === wall.b) {
-        angleDimensions = angleDimensions?.map(dimension => dimension.vertex === wall.b
-          ? {
-            ...dimension,
-            wallA: dimension.wallA === wall.id ? segment.id : dimension.wallA,
-            wallB: dimension.wallB === wall.id ? segment.id : dimension.wallB,
-          } : dimension);
-      }
-      for (const opening of attached) {
-        if ((i === 0 || opening.offset >= from.offset) &&
-          (i === cuts.length - 2 || opening.offset < to.offset)) {
-          openingUpdates.set(opening.id, { ...opening, wallId: segment.id, offset: opening.offset - from.offset });
-        }
-      }
-    }
+    const parts = partitionWall(plan, wall, cuts, angleDimensions, thicknessDimensions);
+    walls.push(...parts.walls);
+    angleDimensions = parts.angleDimensions;
+    thicknessDimensions = parts.thicknessDimensions;
+    for (const opening of parts.openings) openingUpdates.set(opening.id, opening);
   }
 
   const interior = length > EPS ? nodes.map(node => ({ node, projection: projectToWall(node, aNode, bNode) }))
@@ -452,6 +536,7 @@ function insertWall(plan: Plan, start: Point, end: Point, thickness: number, reu
   return validatePlan({
     ...plan, nodes, walls, openings: plan.openings.map(opening => openingUpdates.get(opening.id) ?? opening),
     ...(Object.hasOwn(plan, "angleDimensions") ? { angleDimensions } : {}),
+    ...(Object.hasOwn(plan, "thicknessDimensions") ? { thicknessDimensions } : {}),
   });
 }
 
@@ -502,6 +587,50 @@ export function moveNode(plan: Plan, nodeId: string, position: Point): Plan {
   });
 }
 
+function remapRoomNames(plan: Plan, next: Plan, replaceNode = (nodeId: string) => nodeId): Plan {
+  if (!Object.keys(plan.roomNames).length) return next;
+  const usedNodes = new Set(next.nodes.map(node => node.id));
+  const survivingRooms = new Set(detectRooms(next).map(room => room.id));
+  const roomNames = { ...plan.roomNames };
+  for (const [previous, name] of Object.entries(plan.roomNames)) {
+    const boundary = [...new Set(previous.slice(5).split(":").map(replaceNode).filter(id => usedNodes.has(id)))].sort();
+    const key = `room:${boundary.join(":")}`;
+    if (key !== previous && survivingRooms.has(key)) {
+      delete roomNames[previous];
+      if (!Object.hasOwn(roomNames, key)) roomNames[key] = name;
+    }
+  }
+  return validatePlan({ ...next, roomNames });
+}
+
+export function mergeNodes(plan: Plan, nodeId: string, targetId: string): Plan {
+  ensure(plan.nodes.some(node => node.id === nodeId), "The selected junction no longer exists.");
+  ensure(plan.nodes.some(node => node.id === targetId), "The target junction no longer exists.");
+  if (nodeId === targetId) return plan;
+  const replaceNode = (id: string) => id === nodeId ? targetId : id;
+  const walls = plan.walls.flatMap(wall => {
+    const a = replaceNode(wall.a), b = replaceNode(wall.b);
+    return a === b ? [] : [{ ...wall, a, b }];
+  });
+  const byWall = new Map(walls.map(wall => [wall.id, wall]));
+  const usedNodes = new Set(walls.flatMap(wall => [wall.a, wall.b]));
+  const angleDimensions = plan.angleDimensions?.flatMap(dimension => {
+    const first = byWall.get(dimension.wallA), second = byWall.get(dimension.wallB);
+    const vertex = replaceNode(dimension.vertex);
+    if (!first || !second || findSharedWallVertex(first, second) !== vertex) return [];
+    return [{ ...dimension, vertex }];
+  });
+  const next = validatePlan({
+    ...plan, walls, nodes: plan.nodes.filter(node => usedNodes.has(node.id)),
+    openings: plan.openings.filter(opening => byWall.has(opening.wallId)),
+    ...(Object.hasOwn(plan, "angleDimensions") ? { angleDimensions } : {}),
+    ...(Object.hasOwn(plan, "thicknessDimensions") ? {
+      thicknessDimensions: plan.thicknessDimensions?.filter(dimension => byWall.has(dimension.wallId)),
+    } : {}),
+  });
+  return remapRoomNames(plan, next, replaceNode);
+}
+
 export function resizeWall(plan: Plan, wallId: string, length: number): Plan {
   checkLength(length);
   const wall = findWall(plan, wallId);
@@ -548,7 +677,130 @@ export function deleteWall(plan: Plan, wallId: string): Plan {
     ...(Object.hasOwn(plan, "angleDimensions") ? {
       angleDimensions: plan.angleDimensions?.filter(dimension => dimension.wallA !== wallId && dimension.wallB !== wallId),
     } : {}),
+    ...(Object.hasOwn(plan, "thicknessDimensions") ? {
+      thicknessDimensions: plan.thicknessDimensions?.filter(dimension => dimension.wallId !== wallId),
+    } : {}),
   });
+}
+
+function nodeDeletionTopology(plan: Plan, nodeId: string) {
+  ensure(plan.nodes.some(node => node.id === nodeId), "The selected junction no longer exists.");
+  const attached = plan.walls.filter(wall => wall.a === nodeId || wall.b === nodeId);
+  const ids = new Set(attached.map(wall => wall.id));
+  let merged: Wall | undefined;
+  if (attached.length === 2) {
+    const [first, second] = attached;
+    const other = second.a === nodeId ? second.b : second.a;
+    const a = first.a === nodeId ? other : first.a;
+    const b = first.b === nodeId ? other : first.b;
+    if (a !== b) merged = { ...first, a, b, dimension: first.dimension || second.dimension };
+  }
+  const walls = plan.walls.flatMap(wall => !ids.has(wall.id) ? [wall]
+    : merged && wall.id === merged.id ? [merged] : []);
+  const byWall = new Map(walls.map(wall => [wall.id, wall]));
+  const angleDimensions = plan.angleDimensions?.flatMap(dimension => {
+    if (dimension.vertex === nodeId) return [];
+    const wallA = ids.has(dimension.wallA) ? merged?.id : dimension.wallA;
+    const wallB = ids.has(dimension.wallB) ? merged?.id : dimension.wallB;
+    const first = wallA && byWall.get(wallA), second = wallB && byWall.get(wallB);
+    if (!first || !second || wallA === wallB) return [];
+    if (findSharedWallVertex(first, second) !== dimension.vertex) return [];
+    return [{ ...dimension, wallA: first.id, wallB: second.id }];
+  });
+  return { attached, ids, merged, walls, angleDimensions };
+}
+
+export function getNodeDeletionInfo(plan: Plan, nodeId: string) {
+  const { attached, ids, merged, angleDimensions } = nodeDeletionTopology(plan, nodeId);
+  return {
+    joinsWalls: !!merged,
+    wallCount: attached.length,
+    removedOpenings: merged ? 0 : plan.openings.filter(opening => ids.has(opening.wallId)).length,
+    removedAngles: (plan.angleDimensions?.length ?? 0) - (angleDimensions?.length ?? 0),
+    removedThickness: merged ? 0 : (plan.thicknessDimensions ?? []).filter(dimension => ids.has(dimension.wallId)).length,
+    changesStyle: !!merged && (attached[0].thickness !== attached[1].thickness
+      || attached[0].dimensionOffset !== attached[1].dimensionOffset),
+  };
+}
+
+export function deleteNode(plan: Plan, nodeId: string): Plan {
+  const { attached, ids, merged, walls, angleDimensions } = nodeDeletionTopology(plan, nodeId);
+  const usedNodes = new Set(walls.flatMap(wall => [wall.a, wall.b]));
+  const nodes = plan.nodes.filter(node => usedNodes.has(node.id));
+  let openings = plan.openings.filter(opening => !ids.has(opening.wallId));
+  let thicknessDimensions = plan.thicknessDimensions?.filter(dimension => !ids.has(dimension.wallId));
+  if (merged) {
+    const [a, b] = wallPoints(plan, merged);
+    const length = distance(a, b);
+    const junction = plan.nodes.find(node => node.id === nodeId)!;
+    const joinedPosition = (source: Wall, position: number) => {
+      const [start, end] = wallPoints(plan, source);
+      const oldLength = distance(start, end);
+      const firstSegment = source.a === merged.a || source.b === merged.a;
+      const reversed = firstSegment ? source.b === merged.a : source.a === merged.b;
+      let offset: number;
+      if (oldLength > EPS && length > EPS) {
+        // Project without clamping so existing overhangs remain editable.
+        const center = interpolate(start, end, position / oldLength);
+        offset = dot(subtract(center, a), subtract(b, a)) / length;
+      } else {
+        // Collapsed geometry has no projection axis; retain its oriented path position.
+        offset = (firstSegment ? 0 : distance(a, junction))
+          + (reversed ? oldLength - position : position);
+      }
+      return { offset, reversed };
+    };
+    openings = plan.openings.map(opening => {
+      if (!ids.has(opening.wallId)) return opening;
+      const source = attached.find(wall => wall.id === opening.wallId)!;
+      const { offset, reversed } = joinedPosition(source, opening.offset);
+      const next: Opening = { ...opening, wallId: merged.id, offset };
+      if (reversed && opening.kind === "door") {
+        next.flip = !opening.flip;
+        if (opening.hingeAtEnd) delete next.hingeAtEnd;
+        else next.hingeAtEnd = true;
+      }
+      return next;
+    });
+    thicknessDimensions = plan.thicknessDimensions?.map(dimension => {
+      if (!ids.has(dimension.wallId)) return dimension;
+      const source = attached.find(wall => wall.id === dimension.wallId)!;
+      const station = distance(...wallPoints(plan, source)) + dimension.offset;
+      return { ...dimension, wallId: merged.id, offset: joinedPosition(source, station).offset - length };
+    });
+  }
+  const next = validatePlan({
+    ...plan, nodes, walls, openings,
+    ...(Object.hasOwn(plan, "angleDimensions") ? { angleDimensions } : {}),
+    ...(Object.hasOwn(plan, "thicknessDimensions") ? { thicknessDimensions } : {}),
+  });
+  return remapRoomNames(plan, next);
+}
+
+export function addThicknessDimension(plan: Plan, wallId: string, offset = DEFAULT_THICKNESS_DIMENSION_OFFSET): Plan {
+  const wall = findWall(plan, wallId);
+  ensure(!isWallDegenerate(plan, wall), "Move the wall's junctions apart before adding a thickness measurement.");
+  checkThicknessDimensionOffset(offset);
+  return validatePlan({
+    ...plan, thicknessDimensions: [...(plan.thicknessDimensions ?? []), { id: id(), wallId, offset }],
+  });
+}
+
+export function updateThicknessDimension(plan: Plan, dimensionId: string, patch: { offset: number }): Plan {
+  const dimension = plan.thicknessDimensions?.find(item => item.id === dimensionId);
+  ensure(dimension, "The selected thickness measurement no longer exists.");
+  exactKeys(record(patch, "Thickness measurement changes"), ["offset"], "Thickness measurement changes");
+  checkThicknessDimensionOffset(patch.offset);
+  if (dimension.offset === patch.offset) return plan;
+  return validatePlan({
+    ...plan, thicknessDimensions: plan.thicknessDimensions!.map(item => item.id === dimensionId ? { ...item, ...patch } : item),
+  });
+}
+
+export function deleteThicknessDimension(plan: Plan, dimensionId: string): Plan {
+  const dimensions = plan.thicknessDimensions;
+  ensure(dimensions && dimensions.some(item => item.id === dimensionId), "The selected thickness measurement no longer exists.");
+  return validatePlan({ ...plan, thicknessDimensions: dimensions.filter(item => item.id !== dimensionId) });
 }
 
 export function addAngleDimension(plan: Plan, dimension: Omit<AngleDimension, "id">): Plan {
@@ -580,10 +832,7 @@ function checkAngle(degrees: number): void {
 }
 
 export function parseAngle(input: string): number {
-  ensure(typeof input === "string" && input.length <= 120, "Enter an angle in degrees, such as 90 or 112.5 deg.");
-  const match = input.trim().match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(?:\u00b0|deg(?:ree(?:s)?)?)?$/i);
-  ensure(match, "Enter an angle in degrees, such as 90 or 112.5 deg.");
-  const degrees = Number(match[1]);
+  const degrees = evaluateMeasurement(input, "angle");
   checkAngle(degrees);
   return degrees;
 }
@@ -728,75 +977,66 @@ export function renameRoom(plan: Plan, roomId: string, name: string): Plan {
   return validatePlan({ ...plan, roomNames: { ...plan.roomNames, [roomId]: trimmed } });
 }
 
-export function formatLength(mm: number, units: Plan["units"]): string {
+export type MeasurementSettings = Plan["units"] | Pick<Plan, "units" | "lengthUnits">;
+
+export function getLengthUnit(settings: MeasurementSettings): LengthUnit {
+  const units = typeof settings === "string" ? settings : settings.units;
+  checkUnits(units);
+  const selected = typeof settings === "string" ? undefined : settings.lengthUnits?.[units];
+  ensure(selected === undefined || (units === "metric" ? selected === "m" || selected === "cm" : selected === "ft" || selected === "in"),
+    "Length units must match the measurement system.");
+  return selected ?? (units === "metric" ? "m" : "ft");
+}
+
+export function setLengthUnit(plan: Plan, unit: string): Plan {
+  ensure(plan.units === "metric" ? unit === "m" || unit === "cm" : unit === "ft" || unit === "in",
+    "Choose meters or centimeters for metric, or feet or inches for imperial.");
+  if (getLengthUnit(plan) === unit) return plan;
+  const lengthUnits: LengthUnits = plan.lengthUnits ?? { metric: "m", imperial: "ft" };
+  return validatePlan({
+    ...plan, lengthUnits: unit === "m" || unit === "cm"
+      ? { ...lengthUnits, metric: unit } : { ...lengthUnits, imperial: unit },
+  });
+}
+
+export function formatLength(mm: number, units: MeasurementSettings): string {
   finite(mm, "Length");
   ensure(mm >= 0, "Length cannot be negative.");
-  checkUnits(units);
-  if (units === "metric") return `${Number((mm / 1_000).toFixed(3))} m`;
+  const unit = getLengthUnit(units);
+  if (unit === "m") return `${Number((mm / 1_000).toFixed(3))} m`;
+  if (unit === "cm") return `${Number((mm / 10).toFixed(1))} cm`;
   const scaledInches = Math.round(mm / 25.4 * 10_000);
+  if (unit === "in") return `${scaledInches / 10_000}"`;
   const feet = Math.floor(scaledInches / 120_000);
   const inches = (scaledInches - feet * 120_000) / 10_000;
   return `${feet}' ${inches}"`;
 }
 
-const AMOUNT = String.raw`(?:\d+\s+\d+\s*\/\s*\d+|\d+\s*\/\s*\d+|(?:\d+(?:\.\d*)?|\.\d+))`;
-const SCALAR = new RegExp(`^(${AMOUNT})$`);
-const METRIC = new RegExp(`^(${AMOUNT})\\s*(mm|cm|m|millimeters?|millimetres?|centimeters?|centimetres?|meters?|metres?)$`);
-const FEET = new RegExp(`^(${AMOUNT})\\s*(?:ft|feet|foot|')\\s*(?:(${AMOUNT})\\s*(?:in|inches|inch|"))?$`);
-const INCHES = new RegExp(`^(${AMOUNT})\\s*(?:in|inches|inch|")$`);
-
-function amount(input: string): number {
-  const fraction = input.match(/^(?:(\d+)\s+)?(\d+)\s*\/\s*(\d+)$/);
-  if (!fraction) return Number(input);
-  const denominator = Number(fraction[3]);
-  ensure(denominator > 0, "A fraction must have a denominator greater than zero.");
-  const numerator = Number(fraction[2]);
-  ensure(!fraction[1] || numerator < denominator, "Use a proper fraction after a whole number, such as 6 1/2.");
-  return Number(fraction[1] ?? 0) + numerator / denominator;
+export function formatLengthInput(mm: number, units: MeasurementSettings): string {
+  finite(mm, "Length");
+  const unit = getLengthUnit(units);
+  if (unit === "m") return `${Number((mm / 1000).toFixed(4))} m`;
+  if (unit === "cm") return `${Number((mm / 10).toFixed(2))} cm`;
+  return `${mm < 0 ? "-" : ""}${formatLength(Math.abs(mm), units)}`;
 }
 
 function checkUnits(units: unknown): asserts units is Plan["units"] {
   ensure(units === "metric" || units === "imperial", "Units must be metric or imperial.");
 }
 
-function parseMeasurement(input: string, units: Plan["units"], position: boolean): number {
-  checkUnits(units);
-  ensure(typeof input === "string" && input.length <= 120, "Enter a length such as 4.2 m or 12' 6\".");
-  let text = input.trim().toLowerCase().replace(/\u2032/g, "'").replace(/\u2033/g, '"');
-  let sign = 1;
-  if (position && (text.startsWith("-") || text.startsWith("+"))) {
-    sign = text.startsWith("-") ? -1 : 1;
-    text = text.slice(1).trimStart();
-  }
-  const metric = text.match(METRIC);
-  const feet = text.match(FEET);
-  const inches = text.match(INCHES);
-  const scalar = text.match(SCALAR);
-  let result: number;
-  if (metric) {
-    const unit = metric[2]!;
-    const multiplier = unit === "mm" || unit.startsWith("milli") ? 1 : unit === "cm" || unit.startsWith("centi") ? 10 : 1_000;
-    result = amount(metric[1]!) * multiplier;
-  } else if (feet) {
-    result = amount(feet[1]!) * 304.8 + (feet[2] ? amount(feet[2]) * 25.4 : 0);
-  } else if (inches) {
-    result = amount(inches[1]!) * 25.4;
-  } else if (scalar) {
-    result = amount(scalar[1]!) * (units === "metric" ? 1_000 : 304.8);
-  } else {
-    throw new Error("Enter a valid length, such as 4.2 m, 420 cm, 4200 mm, or 12' 6 1/2\".");
-  }
-  ensure(Number.isFinite(result) && (position ? result >= 0 : result > 0),
+function parseMeasurement(input: string, units: MeasurementSettings, position: boolean): number {
+  const result = evaluateMeasurement(input, getLengthUnit(units));
+  ensure(Number.isFinite(result) && (position || result > 0),
     position ? "Position must be a finite length or zero." : "Length must be greater than zero and finite.");
-  ensure(result <= MAX_SCENE_LENGTH, "This length exceeds the drawing's 100 m coordinate limit.");
-  return result === 0 ? 0 : sign * result;
+  ensure(Math.abs(result) <= MAX_SCENE_LENGTH, "This length exceeds the drawing's 100 m coordinate limit.");
+  return result === 0 ? 0 : result;
 }
 
-export function parseLength(input: string, units: Plan["units"]): number {
+export function parseLength(input: string, units: MeasurementSettings): number {
   return parseMeasurement(input, units, false);
 }
 
-export function parsePosition(input: string, units: Plan["units"]): number {
+export function parsePosition(input: string, units: MeasurementSettings): number {
   return parseMeasurement(input, units, true);
 }
 
@@ -845,10 +1085,20 @@ function collection(value: unknown, max: number, label: string): unknown[] {
 export function validatePlan(value: unknown): Plan {
   const source = record(value, "Plan");
   exactKeys(source, ["version", "name", "units", "nodes", "walls", "openings", "roomNames",
-    ...(Object.hasOwn(source, "angleDimensions") ? ["angleDimensions"] : [])], "Plan");
+    ...(Object.hasOwn(source, "lengthUnits") ? ["lengthUnits"] : []),
+    ...(Object.hasOwn(source, "angleDimensions") ? ["angleDimensions"] : []),
+    ...(Object.hasOwn(source, "thicknessDimensions") ? ["thicknessDimensions"] : [])], "Plan");
   ensure(source.version === 1, "Unsupported plan version. Expected version 1.");
   const name = textName(source.name, "Plan name");
   checkUnits(source.units);
+  let lengthUnits: LengthUnits | undefined;
+  if (Object.hasOwn(source, "lengthUnits")) {
+    const preference = record(source.lengthUnits, "Length units");
+    exactKeys(preference, ["metric", "imperial"], "Length units");
+    ensure(preference.metric === "m" || preference.metric === "cm", "Metric length units must be m or cm.");
+    ensure(preference.imperial === "ft" || preference.imperial === "in", "Imperial length units must be ft or in.");
+    lengthUnits = { metric: preference.metric, imperial: preference.imperial };
+  }
   const seenIds = new Set<string>();
   const uniqueId = (value: unknown, label: string): string => {
     const result = identifier(value, label);
@@ -895,7 +1145,8 @@ export function validatePlan(value: unknown): Plan {
   const byWall = new Map(walls.map(wall => [wall.id, wall]));
   const openings: Opening[] = collection(source.openings, MAX_OPENINGS, "Openings").map(value => {
     const opening = record(value, "Opening");
-    exactKeys(opening, ["id", "wallId", "kind", "offset", "width", "flip"], "Opening");
+    exactKeys(opening, ["id", "wallId", "kind", "offset", "width", "flip",
+      ...(Object.hasOwn(opening, "hingeAtEnd") ? ["hingeAtEnd"] : [])], "Opening");
     const openingId = uniqueId(opening.id, "Opening ID");
     const wallId = identifier(opening.wallId, "Opening wall");
     const wall = byWall.get(wallId);
@@ -907,9 +1158,15 @@ export function validatePlan(value: unknown): Plan {
     ensure(opening.width <= MAX_SCENE_LENGTH, "Opening width exceeds the drawing's maximum length.");
     ensure(Math.abs(opening.offset) <= MAX_SCENE_LENGTH, "Opening position exceeds the drawing's maximum length.");
     ensure(typeof opening.flip === "boolean", "Opening swing must be true or false.");
-    return {
+    const result: Opening = {
       id: openingId, wallId, kind: opening.kind, offset: opening.offset, width: opening.width, flip: opening.flip,
     };
+    if (Object.hasOwn(opening, "hingeAtEnd")) {
+      ensure(opening.kind === "door" && typeof opening.hingeAtEnd === "boolean",
+        "Door hinge side must be true or false and can only be set on doors.");
+      result.hingeAtEnd = opening.hingeAtEnd;
+    }
+    return result;
   });
   let angleDimensions: AngleDimension[] | undefined;
   if (Object.hasOwn(source, "angleDimensions")) {
@@ -937,6 +1194,18 @@ export function validatePlan(value: unknown): Plan {
       return { id: dimensionId, wallA, wallB, vertex, radius: dimension.radius, clockwise: dimension.clockwise };
     });
   }
+  let thicknessDimensions: ThicknessDimension[] | undefined;
+  if (Object.hasOwn(source, "thicknessDimensions")) {
+    thicknessDimensions = collection(source.thicknessDimensions, MAX_THICKNESS_DIMENSIONS, "Thickness measurements").map(value => {
+      const dimension = record(value, "Thickness measurement");
+      exactKeys(dimension, ["id", "wallId", "offset"], "Thickness measurement");
+      const dimensionId = uniqueId(dimension.id, "Thickness measurement ID");
+      const wallId = identifier(dimension.wallId, "Thickness measurement wall");
+      ensure(byWall.has(wallId), "A thickness measurement refers to a missing wall.");
+      checkThicknessDimensionOffset(dimension.offset);
+      return { id: dimensionId, wallId, offset: dimension.offset };
+    });
+  }
   const names = record(source.roomNames, "Room names");
   const entries = Object.entries(names);
   ensure(entries.length <= MAX_WALLS, "Too many saved room names.");
@@ -955,7 +1224,9 @@ export function validatePlan(value: unknown): Plan {
   }));
   return {
     version: 1, name, units: source.units, nodes, walls, openings, roomNames,
+    ...(lengthUnits !== undefined ? { lengthUnits } : {}),
     ...(angleDimensions !== undefined ? { angleDimensions } : {}),
+    ...(thicknessDimensions !== undefined ? { thicknessDimensions } : {}),
   };
 }
 

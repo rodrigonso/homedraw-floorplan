@@ -749,7 +749,7 @@ test("node drags cancel or retain collapsed walls with red feedback", async ({ p
   await page.mouse.up();
   await expect(target).toHaveAttribute("cx", "4200");
   expect(await savedPlan(page)).toEqual(original);
-  await page.getByRole("textbox", { name: "Wall length", exact: true }).focus();
+  await page.getByRole("textbox", { name: "Project name", exact: true }).focus();
   await begin();
   await page.keyboard.press("Escape");
   await page.mouse.up();
@@ -761,12 +761,14 @@ test("node drags cancel or retain collapsed walls with red feedback", async ({ p
   await expect(target).toHaveAttribute("cx", "4200");
   expect(await savedPlan(page)).toEqual(original);
   await begin();
+  await page.keyboard.down("Alt");
   await page.mouse.move(positions.invalid.x, positions.invalid.y, { steps: 1 });
   await expect(page.getByTestId("geometry-feedback")).toBeVisible();
   await expect(page.locator(".toast.error")).toHaveCount(0);
   await expect(target).toHaveAttribute("cx", "6800");
   expect(await savedPlan(page)).toEqual(original);
   await page.mouse.up();
+  await page.keyboard.up("Alt");
   await expect(target).toHaveAttribute("cx", "6800");
   const collapsed = await savedPlan(page);
   expect(collapsed.nodes.find(n => n.id === node.id)).toMatchObject({ x: 6800, y: 0 });

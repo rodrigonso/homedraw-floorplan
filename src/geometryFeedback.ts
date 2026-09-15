@@ -1,6 +1,7 @@
 import { distance, isWallDegenerate, wallPoints, type GeometryIssue, type Opening, type Plan, type Point } from "./model";
+import { palette } from "./theme";
 
-export const GEOMETRY_RED = "#c83f45";
+export const GEOMETRY_RED = palette.warning;
 export type GeometryHighlight =
   | { kind: "wall" | "opening"; id: string; a: Point; b: Point; width: number }
   | { kind: "node" | "angle"; id: string; point: Point };

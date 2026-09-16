@@ -56,7 +56,12 @@ describe("attached dimension placement", () => {
     expect(moved.label.x - tilted.label.x).toBeCloseTo(200);
     expect(moved.label.y - tilted.label.y).toBeCloseTo(100);
     plan = setWallThickness(plan, plan.walls[1].id, 300);
-    expect(dimensionPosition(plan, plan.walls[1])).toEqual(moved);
+    const thicker = dimensionPosition(plan, plan.walls[1]);
+    expect(thicker).toMatchObject({
+      a: moved.a, b: moved.b, label: moved.label, normal: moved.normal,
+      axis: moved.axis, offset: moved.offset, ticks: moved.ticks,
+    });
+    expect(thicker.extensions).not.toEqual(moved.extensions);
     plan = toggleDimension(plan, plan.walls[1].id);
     plan = toggleDimension(plan, plan.walls[1].id);
     expect(plan.walls[1].dimensionOffset).toBe(-650);
@@ -102,5 +107,18 @@ describe("attached dimension placement", () => {
     const inside = dimensionPosition(plan, { ...plan.walls[0], dimensionOffset: 800 });
     expect(outside.normal.y).toBe(-1);
     expect(inside.normal.y).toBe(1);
+  });
+
+  it.each([-800, -50, 0, 50, 800])("shares extension and tick geometry at offset %s", offset => {
+    const plan = rectangle();
+    const dim = dimensionPosition(plan, { ...plan.walls[0], dimensionOffset: offset });
+    const side = offset < 0 ? -1 : 1;
+    const gap = Math.min(175, Math.abs(offset));
+    expect(dim.extensions).toEqual([0, 4000].map(x => [
+      { x, y: gap * side }, { x, y: offset + 80 * side },
+    ]));
+    expect(dim.ticks).toEqual([0, 4000].map(x => [
+      { x: x - 45, y: offset + 65 }, { x: x + 45, y: offset - 65 },
+    ]));
   });
 });

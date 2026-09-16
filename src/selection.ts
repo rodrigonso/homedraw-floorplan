@@ -1,11 +1,11 @@
 import { anglePosition, formatAngle, hasAngleGeometry } from "./angles";
-import { thicknessDimensionPosition } from "./dimensions";
+import { dimensionPosition, thicknessDimensionPosition } from "./dimensions";
 import {
   deleteNode, detectRooms, distance, formatLength, validatePlan, wallPoints,
   type AngleDimension, type Opening, type Plan, type Point, type Room, type ThicknessDimension, type Wall,
 } from "./model";
 
-export type SelectionItem = { kind: "wall" | "node" | "door" | "window" | "angle" | "room" | "thickness"; id: string };
+export type SelectionItem = { kind: "wall" | "node" | "door" | "window" | "dimension" | "angle" | "room" | "thickness"; id: string };
 export type SelectionBounds = { x: number; y: number; width: number; height: number };
 
 const EPS = 1e-6;
@@ -26,13 +26,14 @@ function resolveSelection(plan: Plan, items: readonly SelectionItem[], allowRoom
   const thickness = new Map((plan.thicknessDimensions ?? []).map(dimension => [dimension.id, dimension]));
   const wallIds = new Set<string>(), nodeIds = new Set<string>();
   const openingIds = new Set<string>(), angleIds = new Set<string>();
-  const thicknessIds = new Set<string>();
+  const dimensionIds = new Set<string>(), thicknessIds = new Set<string>();
   const rooms: Room[] = [];
   let availableRooms: Room[] | undefined;
   for (const item of items) {
     let exists = false;
     switch (item.kind) {
       case "wall": exists = walls.has(item.id); wallIds.add(item.id); break;
+      case "dimension": exists = walls.get(item.id)?.dimension === true; dimensionIds.add(item.id); break;
       case "node": exists = nodes.has(item.id); nodeIds.add(item.id); break;
       case "door":
       case "window":
@@ -82,7 +83,7 @@ function resolveSelection(plan: Plan, items: readonly SelectionItem[], allowRoom
   const movedNodeIds = new Set([...nodeIds, ...coveredNodeIds]);
   const affectedWallIds = new Set(plan.walls
     .filter(wall => movedNodeIds.has(wall.a) || movedNodeIds.has(wall.b)).map(wall => wall.id));
-  return { wallIds, nodeIds, openingIds, angleIds, thicknessIds, coveredNodeIds, movedNodeIds, affectedWallIds, rooms };
+  return { wallIds, nodeIds, openingIds, dimensionIds, angleIds, thicknessIds, coveredNodeIds, movedNodeIds, affectedWallIds, rooms };
 }
 
 function bodyPoints(a: Point, b: Point, thickness: number): Point[] {
@@ -96,9 +97,29 @@ function bodyPoints(a: Point, b: Point, thickness: number): Point[] {
   ];
 }
 
+export function getSelectionNodeIds(plan: Plan, items: readonly SelectionItem[]): string[] {
+  return [...resolveSelection(plan, items).movedNodeIds];
+}
+
 function wallBody(plan: Plan, wall: Wall): Point[] {
   const points = wallPoints(plan, wall);
   return distance(...points) < 1 ? points : bodyPoints(...points, wall.thickness);
+}
+
+function dimensionBody(plan: Plan, wall: Wall): Point[] {
+  const [a, b] = wallPoints(plan, wall), length = distance(a, b);
+  const text = formatLength(length, plan);
+  if (length < 1) {
+    const halfWidth = text.length * 40;
+    return [{ x: a.x - halfWidth, y: a.y + 160 }, { x: a.x + halfWidth, y: a.y + 360 }];
+  }
+  const dim = dimensionPosition(plan, wall);
+  const halfWidth = Math.max(240, text.length * 40);
+  return [
+    dim.a, dim.b, ...dim.extensions.flat(), ...dim.ticks.flat(),
+    { x: dim.label.x - halfWidth, y: dim.label.y - 120 },
+    { x: dim.label.x + halfWidth, y: dim.label.y + 120 },
+  ];
 }
 
 function arcExtrema(center: Point, radius: number, start: number, sweep: number): Point[] {
@@ -135,7 +156,11 @@ function angleBody(plan: Plan, dimension: AngleDimension): Point[] {
   if (!hasAngleGeometry(plan, dimension)) {
     const vertex = plan.nodes.find(node => node.id === dimension.vertex);
     if (!vertex) throw new Error("An angle dimension refers to a missing junction.");
-    return [vertex];
+    const halfWidth = "Angle unavailable".length * 40;
+    return [
+      { x: vertex.x - halfWidth, y: vertex.y - 240 },
+      { x: vertex.x + halfWidth, y: vertex.y - 40 },
+    ];
   }
   const angle = anglePosition(plan, dimension);
   // Match the rendered label background's estimated size, expressed in millimeters.
@@ -185,6 +210,9 @@ export function selectionBounds(plan: Plan, items: readonly SelectionItem[], sho
       points.push(...openingBody(plan, opening));
     }
   }
+  if (showDimensions) for (const wall of plan.walls) {
+    if (selected.dimensionIds.has(wall.id)) points.push(...dimensionBody(plan, wall));
+  }
   if (showDimensions) for (const angle of plan.angleDimensions ?? []) {
     if (selected.angleIds.has(angle.id) || selected.affectedWallIds.has(angle.wallA)
       || selected.affectedWallIds.has(angle.wallB)) points.push(...angleBody(plan, angle));
@@ -219,6 +247,11 @@ export function getMarqueeSelection(
       items.push({ kind: opening.kind, id: opening.id });
     }
   }
+  if (showDimensions) for (const wall of plan.walls) {
+    if (wall.dimension && !wallIds.has(wall.id) && contained(dimensionBody(plan, wall))) {
+      items.push({ kind: "dimension", id: wall.id });
+    }
+  }
   if (showDimensions) for (const angle of plan.angleDimensions ?? []) {
     if (!wallIds.has(angle.wallA) && !wallIds.has(angle.wallB) && contained(angleBody(plan, angle))) {
       items.push({ kind: "angle", id: angle.id });
@@ -240,6 +273,15 @@ export function moveSelection(plan: Plan, items: readonly SelectionItem[], delta
     const next = { ...node, x: node.x + delta.x, y: node.y + delta.y };
     changed ||= next.x !== node.x || next.y !== node.y;
     return next;
+  });
+  const walls = plan.walls.map(wall => {
+    if (!selected.dimensionIds.has(wall.id) || selected.affectedWallIds.has(wall.id)) return wall;
+    const { axis, offset } = dimensionPosition(plan, wall);
+    const projection = delta.x * axis.x + delta.y * axis.y;
+    const dimensionOffset = offset + projection;
+    if (dimensionOffset === offset) return wall;
+    changed ||= Math.abs(dimensionOffset - offset) > EPS;
+    return { ...wall, dimensionOffset };
   });
   const openings = plan.openings.map(opening => {
     if (!selected.openingIds.has(opening.id) || selected.affectedWallIds.has(opening.wallId)) return opening;
@@ -271,7 +313,7 @@ export function moveSelection(plan: Plan, items: readonly SelectionItem[], delta
   });
   // Validate even sub-epsilon changes before returning a no-op, so limits stay strict.
   const next = validatePlan({
-    ...plan, nodes, openings,
+    ...plan, nodes, walls, openings,
     ...(Object.hasOwn(plan, "angleDimensions") ? { angleDimensions } : {}),
     ...(Object.hasOwn(plan, "thicknessDimensions") ? { thicknessDimensions } : {}),
   });
@@ -282,11 +324,13 @@ export function deleteSelection(plan: Plan, items: readonly SelectionItem[]): Pl
   const selected = resolveSelection(plan, items);
   if (!items.length) return plan;
   let next = plan;
-  if (selected.wallIds.size || selected.openingIds.size || selected.angleIds.size || selected.thicknessIds.size) {
-    const walls = plan.walls.filter(wall => !selected.wallIds.has(wall.id));
+  if (selected.wallIds.size || selected.openingIds.size || selected.dimensionIds.size
+    || selected.angleIds.size || selected.thicknessIds.size) {
+    const walls = plan.walls.filter(wall => !selected.wallIds.has(wall.id))
+      .map(wall => selected.dimensionIds.has(wall.id) ? { ...wall, dimension: false } : wall);
     const usedNodes = new Set(walls.flatMap(wall => [wall.a, wall.b]));
     next = validatePlan({
-      ...plan, walls, nodes: plan.nodes.filter(node => usedNodes.has(node.id)),
+      ...plan, walls, nodes: plan.nodes.filter(node => !selected.coveredNodeIds.has(node.id) || usedNodes.has(node.id)),
       openings: plan.openings.filter(opening => !selected.wallIds.has(opening.wallId)
         && !selected.openingIds.has(opening.id)),
       ...(Object.hasOwn(plan, "angleDimensions") ? {

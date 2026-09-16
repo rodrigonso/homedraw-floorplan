@@ -139,7 +139,7 @@ test("draw room, resize a dimension, reject invalid edits, name and export", asy
   for await (const chunk of svgStream!) svgChunks.push(Buffer.from(chunk));
   const svgText = Buffer.concat(svgChunks).toString();
   expect(svgText).toContain("<svg");
-  expect(svgText).toContain("My workshop");
+  expect(svgText).not.toContain("My workshop");
   const pngPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "PNG image" }).click();
   const pngStream = await (await pngPromise).createReadStream();
@@ -148,20 +148,20 @@ test("draw room, resize a dimension, reject invalid edits, name and export", asy
   expect(Buffer.concat(pngChunks).subarray(0, 8).toString("hex")).toBe("89504e470d0a1a0a");
 });
 
-test("sketch layer persists and is included in project round trips", async ({ page }) => {
+test("renovation notes persist and are included in project round trips", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", error => errors.push(error.message));
   await page.goto("/");
   await savedPlan(page);
-  await page.getByRole("button", { name: "Sketch & annotate" }).click();
-  await expect(page.getByRole("button", { name: "Done sketching" })).toBeVisible();
+  await page.getByRole("button", { name: "Renovation notes" }).click();
+  await expect(page.getByRole("button", { name: "Done notes" })).toBeVisible();
   const bounds = (await page.locator(".canvas-stage").boundingBox())!;
   await page.mouse.move(bounds.x + 140, bounds.y + bounds.height - 160);
   await page.mouse.down();
   await page.mouse.move(bounds.x + 200, bounds.y + bounds.height - 190, { steps: 10 });
   await page.mouse.move(bounds.x + 260, bounds.y + bounds.height - 160, { steps: 10 });
   await page.mouse.up();
-  await page.getByRole("button", { name: "Done sketching" }).click();
+  await page.getByRole("button", { name: "Done notes" }).click();
   await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("homedraw.project.v1")!).sketches.length)).toBeGreaterThan(0);
   const saved = await page.evaluate(() => localStorage.getItem("homedraw.project.v1")!);
   await page.reload();
@@ -455,7 +455,8 @@ test("vertical dimensions edit after zoom and pan and apply on blur only once", 
   const canvas = (await page.getByTestId("draft-canvas").boundingBox())!;
   await page.mouse.move(canvas.x + 200, canvas.y + 100);
   await page.mouse.down();
-  await page.mouse.move(canvas.x + 170, canvas.y + 125, { steps: 5 });
+  // Keep the label clear of the inspector that opens on the first click.
+  await page.mouse.move(canvas.x + 70, canvas.y + 125, { steps: 5 });
   await page.mouse.up();
   await page.getByRole("button", { name: "Select tool", exact: true }).click();
   await page.getByTestId(`dimension-${wall.id}`).dblclick();

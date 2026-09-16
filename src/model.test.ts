@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   addOpening, addRoom, addWall, createDemoPlan, createEmptyPlan, deleteOpening, deleteWall,
   detectRooms, distance, formatArea, formatLength, getGeometryIssues, isWallDegenerate, moveNode, moveWall, parseLength, parsePosition, projectToWall,
-  renameRoom, resizeWall, setWallThickness, snapPoint, toggleDimension, updateOpening,
+  renameRoom, resizeWall, setWallThickness, toggleDimension, updateOpening,
   validatePlan, wallPoints,
   type Plan, type Point, type Wall,
 } from "./model";
+import { snapDraftPoint } from "./snapGuides";
 
 const p = (x: number, y: number): Point => ({ x, y });
 const rectangle = () => addRoom(createEmptyPlan(), p(0, 0), p(4_000, 3_000), 150);
@@ -512,9 +513,9 @@ describe("projection and snapping", () => {
       point: p(5e-201, 0), offset: 5e-201, distance: 1,
     });
     const collapsed = addWall(createEmptyPlan(), p(100, 100), p(100, 100), 100);
-    expect(snapPoint(collapsed, p(110, 110), 0, 50)).toEqual(p(100, 100));
-    expect(snapPoint(collapsed, p(250, 150), 100, 10)).toEqual(p(300, 200));
-    expect(snapPoint(collapsed, p(250, 110), 100, 10, p(0, 100), true)).toEqual(p(300, 100));
+    expect(snapDraftPoint(collapsed, p(110, 110), 0, 50).point).toEqual(p(100, 100));
+    expect(snapDraftPoint(collapsed, p(250, 150), 100, 10).point).toEqual(p(300, 200));
+    expect(snapDraftPoint(collapsed, p(250, 110), 100, 10, p(0, 100), true).point).toEqual(p(300, 100));
     expect(() => projectToWall(p(NaN, 0), p(0, 0), p(0, 0))).toThrow(/finite/);
   });
 
@@ -532,45 +533,47 @@ describe("projection and snapping", () => {
 
   it("prioritizes nodes, then walls, then grid", () => {
     const plan = singleWall();
-    expect(snapPoint(plan, p(30, 10), 100, 50)).toEqual(p(0, 0));
-    expect(snapPoint(plan, p(1_535, 10), 100, 50)).toEqual(p(1_535, 0));
-    expect(snapPoint(plan, p(1_535, 260), 100, 50)).toEqual(p(1_500, 300));
-    expect(snapPoint(createEmptyPlan(), p(430, 470), 100, 50, p(425, 475))).toEqual(p(425, 475));
+    expect(snapDraftPoint(plan, p(30, 10), 100, 50).point).toEqual(p(0, 0));
+    expect(snapDraftPoint(plan, p(1_535, 10), 100, 50).point).toEqual(p(1_535, 0));
+    expect(snapDraftPoint(plan, p(1_535, 260), 100, 50).point).toEqual(p(1_500, 300));
+    expect(snapDraftPoint(createEmptyPlan(), p(430, 470), 100, 50, p(425, 475)).point).toEqual(p(425, 475));
   });
 
   it("keeps orthogonal node, wall, and grid snaps on the chosen axis", () => {
     const origin = p(25, 35);
     const empty = createEmptyPlan();
-    expect(snapPoint(empty, p(373, 110), 100, 20, origin, true)).toEqual(p(400, 35));
-    expect(snapPoint(empty, p(110, 373), 100, 20, origin, true)).toEqual(p(25, 400));
-    expect(snapPoint(empty, p(35, 39), 100, 20, origin, true)).toEqual(origin);
+    expect(snapDraftPoint(empty, p(373, 110), 100, 20, origin, true).point).toEqual(p(400, 35));
+    expect(snapDraftPoint(empty, p(110, 373), 100, 20, origin, true).point).toEqual(p(25, 400));
+    expect(snapDraftPoint(empty, p(35, 39), 100, 20, origin, true).point).toEqual(origin);
     const plan = addWall(empty, p(390, 50), p(390, 500), 100);
-    expect(snapPoint(plan, p(380, 30), 100, 50, origin, true)).toEqual(p(400, 35));
+    const extension = snapDraftPoint(plan, p(380, 30), 100, 50, origin, true);
+    expect(extension.point).toEqual(p(390, 35));
+    expect(extension.guides.some(guide => guide.kind === "extension")).toBe(true);
     const across = addWall(empty, p(390, 0), p(390, 500), 100);
-    expect(snapPoint(across, p(380, 30), 100, 50, origin, true)).toEqual(p(390, 35));
+    expect(snapDraftPoint(across, p(380, 30), 100, 50, origin, true).point).toEqual(p(390, 35));
     const diagonal = addWall(empty, p(0, 0), p(500, 500), 100);
-    expect(snapPoint(diagonal, p(280, 180), 100, 50, p(0, 250), true)).toEqual(p(250, 250));
+    expect(snapDraftPoint(diagonal, p(280, 180), 100, 50, p(0, 250), true).point).toEqual(p(250, 250));
   });
 
   it("supports disabled snapping without discarding an explicit orthogonal constraint", () => {
     const plan = singleWall();
-    expect(snapPoint(plan, p(1_535, 10), 0, 0)).toEqual(p(1_535, 10));
-    expect(snapPoint(plan, p(0.0000001, 0), 0, 0)).toEqual(p(0.0000001, 0));
-    expect(snapPoint(plan, p(373, 110), 0, 0, p(25, 35), true)).toEqual(p(373, 35));
-    expect(snapPoint(plan, p(110, 373), 0, 0, p(25, 35), true)).toEqual(p(25, 373));
-    expect(snapPoint(plan, p(373, 110), 0, 0, p(25, 35), false)).toEqual(p(373, 110));
+    expect(snapDraftPoint(plan, p(1_535, 10), 0, 0).point).toEqual(p(1_535, 10));
+    expect(snapDraftPoint(plan, p(0.0000001, 0), 0, 0).point).toEqual(p(0.0000001, 0));
+    expect(snapDraftPoint(plan, p(373, 110), 0, 0, p(25, 35), true).point).toEqual(p(373, 35));
+    expect(snapDraftPoint(plan, p(110, 373), 0, 0, p(25, 35), true).point).toEqual(p(25, 373));
+    expect(snapDraftPoint(plan, p(373, 110), 0, 0, p(25, 35), false).point).toEqual(p(373, 110));
   });
 
   it("can disable grid and proximity snapping independently", () => {
     const plan = singleWall();
-    expect(snapPoint(plan, p(1_535, 10), 0, 50)).toEqual(p(1_535, 0));
-    expect(snapPoint(plan, p(1_535, 260), 0, 50)).toEqual(p(1_535, 260));
-    expect(snapPoint(plan, p(1_535, 10), 100, 0)).toEqual(p(1_500, 0));
+    expect(snapDraftPoint(plan, p(1_535, 10), 0, 50).point).toEqual(p(1_535, 0));
+    expect(snapDraftPoint(plan, p(1_535, 260), 0, 50).point).toEqual(p(1_535, 260));
+    expect(snapDraftPoint(plan, p(1_535, 10), 100, 0).point).toEqual(p(1_500, 0));
   });
 
   it("rejects invalid grid and snap settings", () => {
-    expect(() => snapPoint(createEmptyPlan(), p(0, 0), -1, 10)).toThrow(/negative/);
-    expect(() => snapPoint(createEmptyPlan(), p(0, 0), 100, -1)).toThrow(/negative/);
+    expect(() => snapDraftPoint(createEmptyPlan(), p(0, 0), -1, 10)).toThrow(/negative/);
+    expect(() => snapDraftPoint(createEmptyPlan(), p(0, 0), 100, -1)).toThrow(/negative/);
   });
 });
 

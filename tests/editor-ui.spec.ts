@@ -24,7 +24,7 @@ test("minimal chrome keeps the full canvas stable when contextual properties app
   const canvas = page.getByTestId("draft-canvas");
   const original = await canvas.boundingBox();
   expect(original).toEqual({ x: 0, y: 0, ...page.viewportSize() });
-  await expect(page.getByRole("navigation", { name: "Drawing tools" }).getByRole("button")).toHaveCount(9);
+  await expect(page.getByRole("navigation", { name: "Drawing tools" }).getByRole("button")).toHaveCount(10);
   await expect(page.locator(".floating-inspector")).toHaveCount(0);
   await expect(page.locator(".grid-layer")).toHaveCount(0);
   const transform = await canvas.locator(":scope > g").getAttribute("transform");

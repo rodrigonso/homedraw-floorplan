@@ -77,7 +77,7 @@ const MAX_WALLS = 1_000;
 const MAX_OPENINGS = 1_000;
 const MAX_ANGLE_DIMENSIONS = 1_000;
 const MAX_THICKNESS_DIMENSIONS = 1_000;
-export const DEFAULT_THICKNESS_DIMENSION_OFFSET = 350;
+const DEFAULT_THICKNESS_DIMENSION_OFFSET = 350;
 const MAX_NAME = 120;
 const id = () => crypto.randomUUID();
 const dot = (a: Point, b: Point) => a.x * b.x + a.y * b.y;
@@ -300,63 +300,6 @@ export function constrainToAxis(point: Point, origin: Point): Point {
   finite(origin.x, "Origin X"); finite(origin.y, "Origin Y");
   return Math.abs(point.x - origin.x) >= Math.abs(point.y - origin.y)
     ? { x: point.x, y: origin.y } : { x: origin.x, y: point.y };
-}
-
-export function snapPoint(
-  plan: Plan, point: Point, grid: number, threshold: number, origin?: Point, orthogonal = false,
-): Point {
-  checkPoint(point);
-  if (origin) checkPoint(origin, "Drawing origin");
-  finite(grid, "Grid spacing");
-  finite(threshold, "Snap distance");
-  ensure(grid >= 0, "Grid spacing cannot be negative.");
-  ensure(threshold >= 0, "Snap distance cannot be negative.");
-  const target = orthogonal && origin ? constrainToAxis(point, origin) : point;
-  const axis = orthogonal && origin ? (target.y === origin.y ? "x" : "y") : undefined;
-  const onAxis = (candidate: Point) => !axis || !origin ||
-    Math.abs(axis === "x" ? candidate.y - origin.y : candidate.x - origin.x) <= EPS;
-  const constrain = (candidate: Point): Point => axis && origin
-    ? (axis === "x" ? { x: candidate.x, y: origin.y } : { x: origin.x, y: candidate.y })
-    : copyPoint(candidate);
-  const nearest = (candidates: Point[]): Point | undefined => {
-    if (threshold === 0) return undefined;
-    let best: Point | undefined;
-    let bestDistance = threshold + EPS;
-    for (const candidate of candidates) {
-      const gap = distance(target, candidate);
-      if (onAxis(candidate) && gap <= bestDistance) {
-        best = candidate;
-        bestDistance = gap;
-      }
-    }
-    return best && constrain(best);
-  };
-  const node = nearest(origin ? [...plan.nodes, origin] : plan.nodes);
-  if (node) return node;
-  const candidates: Point[] = [];
-  for (const wall of plan.walls) {
-    const [a, b] = wallPoints(plan, wall);
-    if (!axis || !origin) {
-      candidates.push(projectToWall(target, a, b).point);
-    } else {
-      const start = axis === "x" ? a.y : a.x;
-      const end = axis === "x" ? b.y : b.x;
-      const level = axis === "x" ? origin.y : origin.x;
-      if (Math.abs(end - start) <= EPS) {
-        if (Math.abs(start - level) <= EPS) candidates.push(projectToWall(target, a, b).point);
-      } else {
-        const t = (level - start) / (end - start);
-        if (t >= 0 && t <= 1) candidates.push(interpolate(a, b, t));
-      }
-    }
-  }
-  const wallSnap = nearest(candidates);
-  if (wallSnap) return wallSnap;
-  const result = constrain(grid > 0
-    ? { x: Math.round(target.x / grid) * grid, y: Math.round(target.y / grid) * grid }
-    : target);
-  checkPoint(result);
-  return result;
 }
 
 function findWall(plan: Plan, wallId: string): Wall {

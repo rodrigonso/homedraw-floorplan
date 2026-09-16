@@ -17,7 +17,16 @@ export function dimensionPosition(plan: Plan, wall: Wall) {
   // Store a signed wall-local offset, so manual placement never flips as the plan's center changes.
   const normal = { x: axis.x * (offset < 0 ? -1 : 1), y: axis.y * (offset < 0 ? -1 : 1) };
   const shift = (point: Point) => ({ x: point.x + axis.x * offset, y: point.y + axis.y * offset });
-  return { a: shift(a), b: shift(b), label: shift(midpoint), normal, axis, offset };
+  const ends = [shift(a), shift(b)];
+  const gap = Math.min(wall.thickness / 2 + 100, Math.abs(offset));
+  const extensions: [Point, Point][] = [a, b].map((point, index) => [
+    { x: point.x + normal.x * gap, y: point.y + normal.y * gap },
+    { x: ends[index].x + normal.x * 80, y: ends[index].y + normal.y * 80 },
+  ]);
+  const ticks: [Point, Point][] = ends.map(end => [
+    { x: end.x - 45, y: end.y + 65 }, { x: end.x + 45, y: end.y - 65 },
+  ]);
+  return { a: ends[0], b: ends[1], label: shift(midpoint), normal, axis, offset, extensions, ticks };
 }
 
 export function draggedDimensionOffset(offset: number, axis: Point, start: Point, current: Point) {

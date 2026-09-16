@@ -1,22 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
-import {
-  CaptureUpdateAction, Excalidraw, MainMenu, exportToBlob, exportToSvg, getSceneVersion,
-} from "@excalidraw/excalidraw";
-import type { AppState, ExcalidrawImperativeAPI } from "@excalidraw/excalidraw/types";
-import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent, SetStateAction } from "react";
+import DrawingCanvas, { CaptureUpdateAction, exportDrawing, getSceneVersion, getCommonBounds, isEditableTarget, newElementWith, textInteractionClip, type CanvasApi, type CanvasElement, type CanvasState } from "./DrawingCanvas";
+import NotesControls from "./NotesControls";
+import { DeleteButton, GroupActions } from "./SelectionActions";
 import {
   ArrowDownToLine, ArrowUpFromLine, Check, ChevronDown, CircleHelp, DoorOpen, DraftingCompass, Grid2X2,
   Hand, House, Magnet, Maximize, Menu, Minus, MousePointer2, PanelLeftClose, Pencil,
-  Plus, Redo2, Ruler, Save, Scan, Settings2, Square, Trash2, Undo2, X,
+  Plus, Redo2, Ruler, Save, Scan, Settings2, Square, Type, Undo2, X,
 } from "lucide-react";
 import {
-  addAngleDimension, addOpening, addRoom, addThicknessDimension, addWall, angleVertex, createDemoPlan, createEmptyPlan, deleteAngleDimension, deleteNode, deleteOpening, deleteThicknessDimension, deleteWall,
-  constrainToAxis, detectRooms, distance, formatArea, formatLength, formatLengthInput, getGeometryIssues, getLengthUnit, isWallDegenerate, mergeNodes, moveNode, moveWall, parseAngle, parseLength, resizeAngle, resizeWall, setDimensionOffset, setLengthUnit, setWallThickness, snapPoint, splitWall, toggleDimension, updateAngleDimension, updateThicknessDimension, wallPoints,
-  type Plan, type Point,
+  addAngleDimension, addOpening, addRoom, addThicknessDimension, addWall, angleVertex, createDemoPlan, createEmptyPlan,
+  constrainToAxis, detectRooms, distance, formatArea, formatLength, formatLengthInput, getGeometryIssues, getLengthUnit, isWallDegenerate, mergeNodes, moveNode, moveWall, parseAngle, parseLength, resizeAngle, resizeWall, setDimensionOffset, setLengthUnit, setWallThickness, splitWall, toggleDimension, updateAngleDimension, updateThicknessDimension, wallPoints,
+  type Opening, type Plan, type Point,
 } from "./model";
-import { createPlanRenderer, hitTest, isPlanElement, nearestWall, PAPER, planToElements, SCALE, type Selection } from "./scene";
-import { downloadFile, errorMessage, loadInitialProject, makeProject, parseProject, STORAGE_KEY, SUPPORTED_SKETCH_TYPES } from "./storage";
+import { createPlanRenderer, hitTest, isPlanElement, nearestWall, planToElements, SCALE, type Selection } from "./scene";
+import { downloadFile, errorMessage, loadInitialProject, makeProject, parseProject, STORAGE_KEY, SUPPORTED_NOTE_TYPES } from "./storage";
 import Properties, { LengthField } from "./Properties";
 import InlineDimensionEditor from "./InlineDimensionEditor";
 import { dimensionPosition, draggedDimensionOffset, thicknessDimensionPosition } from "./dimensions";
@@ -24,10 +22,13 @@ import { angleDimensionAt, anglePosition, formatAngleInput, hasAngleGeometry } f
 import { createFrameScheduler } from "./frameScheduler";
 import { geometryHighlights, openingPoints } from "./geometryFeedback";
 import EditorPopover from "./EditorPopover";
-import { palette } from "./theme";
-import { deleteSelection, getMarqueeSelection, moveSelection, selectionBounds, type SelectionItem } from "./selection";
+import { deleteSelection, getMarqueeSelection, getSelectionNodeIds, moveSelection, selectionBounds, type SelectionBounds } from "./selection";
+import { expandGroups, groupSelection, ungroupSelection, selectedGroups, reconcileGroups, validateGroups, planMembers, noteMemberIds,
+  type GroupMember as SelectionItem, type ElementGroup } from "./groups";
+import { snapDraftPoint, snapOpeningPosition, snapTranslation, type SnapGuide } from "./snapGuides";
 
-type Tool = "select" | "wall" | "room" | "door" | "window" | "dimension" | "angle" | "sketch" | "hand";
+type Tool = "select" | "wall" | "room" | "door" | "window" | "dimension" | "angle" | "text" | "notes" | "hand";
+const canvasTool = (tool: Tool) => tool === "text" ? "text" : tool === "notes" ? "freedraw" : "selection";
 const tools = [
   { id: "select", label: "Select", key: "V", icon: MousePointer2 },
   { id: "wall", label: "Wall", key: "W", icon: Minus },
@@ -45,7 +46,8 @@ const hints: Record<Tool, string> = {
   window: "Click a wall to place a window. Select it to adjust its position.",
   dimension: "Click a wall to add or remove a dimension. Drag its label or line to reposition it.",
   angle: "Click the first wall, then a connected wall, then click to place the angle measurement. Esc cancels.",
-  sketch: "Add ideas with Excalidraw. Sketches are visual notes, not measured geometry.",
+  text: "Click anywhere and type. Click away to finish; use Select to move text or double-click to edit it.",
+  notes: "Add renovation notes, drawing marks, and arrows. Notes do not change measured geometry.",
   hand: "Drag to pan. Hold Shift to lock an axis. Use the mouse wheel to zoom.",
 };
 type SingleGeometryDrag = {
@@ -54,12 +56,16 @@ type SingleGeometryDrag = {
 };
 type GroupDrag = {
   kind: "group"; items: SelectionItem[]; start: Point; current: Point; base: Plan; preview: Plan; error: string | null; delta: Point;
+  baseNotes: readonly CanvasElement[]; previewNotes: readonly CanvasElement[];
 };
-type SelectionPress = { item: SelectionItem; initial: SelectionItem[]; items: SelectionItem[]; started: boolean };
-type GeometryDrag = (SingleGeometryDrag | GroupDrag) & { press?: SelectionPress };
+type SelectionPress = { item: SelectionItem; initial: SelectionItem[]; items: SelectionItem[]; toggle?: SelectionItem[]; started: boolean };
+type Snapshot = { plan: Plan; notes: readonly CanvasElement[]; groups: readonly ElementGroup[] };
+const noteContent = (notes: readonly CanvasElement[]) => JSON.stringify(notes.map(({ version, versionNonce, updated, index, ...note }) => note));
+type GeometryDrag = (SingleGeometryDrag | GroupDrag) & { press?: SelectionPress; guides?: SnapGuide[] };
 type DimensionDrag = {
   kind: "dimension"; id: string; start: Point; axis: Point; initialOffset: number; offset: number; press?: SelectionPress;
   measurement?: "thickness";
+  guides?: SnapGuide[];
 };
 type ItemDrag = GeometryDrag | DimensionDrag;
 type PointerSample = { clientX: number; clientY: number; altKey: boolean; shiftKey: boolean };
@@ -76,31 +82,136 @@ const ANGLE_PREVIEW_ID = "preview:angle";
 const isGeometryDrag = (movement: Drag | null): movement is GeometryDrag =>
   movement?.kind === "wall" || movement?.kind === "node" || movement?.kind === "angle" || movement?.kind === "group";
 const selectionKey = (item: SelectionItem) => `${item.kind}:${item.id}`;
+const noteSelectionSignature = (ids: readonly string[]) => JSON.stringify([...ids].sort());
 const addSelections = (initial: SelectionItem[], added: SelectionItem[]) =>
   [...new Map([...initial, ...added].map(item => [selectionKey(item), item])).values()];
 const toggleSelection = (items: SelectionItem[], item: SelectionItem) =>
   items.some(selected => selectionKey(selected) === selectionKey(item))
     ? items.filter(selected => selectionKey(selected) !== selectionKey(item)) : [...items, item];
-
-function marqueeItems(plan: Plan, movement: MarqueeDrag, zoom: number, showDimensions: boolean) {
-  if (distance(movement.start, movement.current) * SCALE * zoom <= 3) {
-    return movement.additive ? movement.click ? toggleSelection(movement.initial, movement.click) : movement.initial
-      : movement.click ? [movement.click] : [];
+const toggleSelections = (items: SelectionItem[], toggled: SelectionItem[]) =>
+  toggled.every(item => items.some(selected => selectionKey(selected) === selectionKey(item)))
+    ? items.filter(item => !toggled.some(toggled => selectionKey(item) === selectionKey(toggled))) : addSelections(items, toggled);
+const noteBounds = (elements: readonly CanvasElement[]): SelectionBounds | null => {
+  if (!elements.length) return null;
+  const [left, top, right, bottom] = getCommonBounds(elements);
+  return { x: left / SCALE, y: top / SCALE, width: (right - left) / SCALE, height: (bottom - top) / SCALE };
+};
+function editorBounds(plan: Plan, notes: readonly CanvasElement[], items: readonly SelectionItem[], dimensions: boolean): SelectionBounds | null {
+  const ids = new Set(noteMemberIds(items));
+  const bounds = [selectionBounds(plan, planMembers(items), dimensions), noteBounds(notes.filter(note => ids.has(note.id)))]
+    .filter((bounds): bounds is SelectionBounds => !!bounds);
+  if (!bounds.length) return null;
+  const x = Math.min(...bounds.map(bounds => bounds.x)), y = Math.min(...bounds.map(bounds => bounds.y));
+  return { x, y, width: Math.max(...bounds.map(bounds => bounds.x + bounds.width)) - x,
+    height: Math.max(...bounds.map(bounds => bounds.y + bounds.height)) - y };
+}
+function movedNotes(notes: readonly CanvasElement[], items: readonly SelectionItem[], delta: Point) {
+  if (!delta.x && !delta.y) return notes;
+  const ids = new Set(noteMemberIds(items));
+  return ids.size ? notes.map(note => ids.has(note.id)
+    ? newElementWith(note, { x: note.x + delta.x * SCALE, y: note.y + delta.y * SCALE }) : note) : notes;
+}
+function membersAt(plan: Plan, groups: readonly ElementGroup[], item: SelectionItem): SelectionItem[] {
+  const direct = expandGroups(groups, [item]);
+  if (direct.length > 1) return direct;
+  let wallIds: string[] = [];
+  if (item.kind === "node") wallIds = plan.walls.filter(wall => wall.a === item.id || wall.b === item.id).map(wall => wall.id);
+  else if (item.kind === "dimension") wallIds = [item.id];
+  else if (item.kind === "door" || item.kind === "window") wallIds = plan.openings.filter(opening => opening.id === item.id).map(opening => opening.wallId);
+  else if (item.kind === "thickness") wallIds = (plan.thicknessDimensions ?? []).filter(dimension => dimension.id === item.id).map(dimension => dimension.wallId);
+  else if (item.kind === "angle") wallIds = (plan.angleDimensions ?? []).filter(angle => angle.id === item.id).flatMap(angle => [angle.wallA, angle.wallB]);
+  else if (item.kind === "room") {
+    const nodes = new Set(getSelectionNodeIds(plan, [item]));
+    wallIds = plan.walls.filter(wall => nodes.has(wall.a) && nodes.has(wall.b)).map(wall => wall.id);
   }
-  const items = getMarqueeSelection(plan, movement.start, movement.current, showDimensions);
+  const matching = [...groups].sort((a, b) => b.members.length - a.members.length).find(group => {
+    const contains = (id: string) => group.members.some(member => member.kind === "wall" && member.id === id);
+    return wallIds.length > 0 && (item.kind === "room" ? wallIds.every(contains) : wallIds.some(contains));
+  });
+  return matching?.members ?? [item];
+}
+const nativeNoteSelection = (groups: readonly ElementGroup[], items: readonly SelectionItem[]) => {
+  const ids = noteMemberIds(items);
+  return ids.length === items.length && !selectedGroups(groups, items).length ? ids : [];
+};
+const sameGuides = (a: readonly SnapGuide[] = [], b: readonly SnapGuide[] = []) =>
+  a.length === b.length && a.every((guide, i) => {
+    const other = b[i];
+    return guide.id === other.id && guide.kind === other.kind
+      && guide.a.x === other.a.x && guide.a.y === other.a.y && guide.b.x === other.b.x && guide.b.y === other.b.y
+      && guide.target?.x === other.target?.x && guide.target?.y === other.target?.y;
+  });
+
+function marqueeItems(plan: Plan, notes: readonly CanvasElement[], groups: readonly ElementGroup[], movement: MarqueeDrag, zoom: number, showDimensions: boolean) {
+  if (distance(movement.start, movement.current) * SCALE * zoom <= 3) {
+    const clicked = movement.click ? membersAt(plan, groups, movement.click) : [];
+    return movement.additive ? toggleSelections(movement.initial, clicked) : clicked;
+  }
+  const contains = (bounds: SelectionBounds | null) => !!bounds
+    && bounds.x >= Math.min(movement.start.x, movement.current.x) && bounds.y >= Math.min(movement.start.y, movement.current.y)
+    && bounds.x + bounds.width <= Math.max(movement.start.x, movement.current.x)
+    && bounds.y + bounds.height <= Math.max(movement.start.y, movement.current.y);
+  let items: SelectionItem[] = [...getMarqueeSelection(plan, movement.start, movement.current, showDimensions),
+    ...notes.filter(note => contains(noteBounds([note]))).map(note => ({ kind: "note" as const, id: note.id }))];
+  items = items.filter(item => membersAt(plan, groups, item).length === 1);
+  for (const group of selectedGroups(groups, groups.flatMap(group => group.members))) {
+    const keys = new Set(group.members.map(selectionKey));
+    items = items.filter(item => !keys.has(selectionKey(item)));
+    if (contains(editorBounds(plan, notes, group.members, showDimensions))) items = addSelections(items, group.members);
+  }
   return movement.additive ? addSelections(movement.initial, items) : items;
 }
 
 export default function App() {
-  const [initial] = useState(loadInitialProject);
+  const [initial] = useState(() => {
+    const loaded = loadInitialProject();
+    return { ...loaded, snapshot: {
+      plan: loaded.project.plan, notes: structuredClone(loaded.project.sketches), groups: loaded.project.groups ?? [],
+    } satisfies Snapshot };
+  });
   const [plan, setPlan] = useState(initial.project.plan);
   const planRef = useRef(plan);
-  const [sketches, setSketches] = useState<readonly ExcalidrawElement[]>(initial.project.sketches);
-  const sketchRef = useRef(sketches);
-  const [api, setApi] = useState<ExcalidrawImperativeAPI | null>(null);
+  const [notes, setNotes] = useState<readonly CanvasElement[]>(initial.project.sketches);
+  const notesRef = useRef(notes);
+  const notesVersionRef = useRef(getSceneVersion(notes));
+  const [groups, setGroups] = useState<readonly ElementGroup[]>(initial.snapshot.groups);
+  const groupsRef = useRef(groups);
+  const committed = useRef<Snapshot>(initial.snapshot);
+  const pendingNotes = useRef(false);
+  const syncingProject = useRef(false);
+  const nativeSelectionBase = useRef<SelectionItem[]>([]);
+  const nativeIndividual = useRef(false);
+  const enteredMember = useRef<string | null>(null);
+  const nativeSelectionKey = useRef(noteSelectionSignature([]));
+  // Core state updates are asynchronous; intermediate selection echoes are not new user selections.
+  const expectedNativeSelection = useRef<string | null>(null);
+  const [api, setApi] = useState<CanvasApi | null>(null);
+  const apiRef = useRef(api);
   const [tool, setTool] = useState<Tool>("select");
-  const [selectedItems, setSelectedItems] = useState<SelectionItem[]>([]);
-  const setSelection = useCallback((item: Selection) => setSelectedItems(item ? [item] : []), []);
+  const toolRef = useRef(tool);
+  const editingTextRef = useRef(false);
+  const [selectedItems, setSelectedItemsState] = useState<SelectionItem[]>([]);
+  const selectionRef = useRef(selectedItems);
+  const setSelectedItems = useCallback((update: SetStateAction<SelectionItem[]>) => {
+    const next = typeof update === "function" ? update(selectionRef.current) : update;
+    if (next.length === selectionRef.current.length
+      && next.every((item, index) => selectionKey(item) === selectionKey(selectionRef.current[index]))) return;
+    if (next.length !== 1 || selectionKey(next[0]) !== enteredMember.current) enteredMember.current = null;
+    selectionRef.current = next;
+    setSelectedItemsState(next);
+  }, []);
+  const clearNoteSelection = useCallback(() => {
+    const current = apiRef.current;
+    if (current && notesRef.current.some(note => current.getAppState().selectedElementIds[note.id])) {
+      nativeSelectionKey.current = noteSelectionSignature([]);
+      expectedNativeSelection.current = nativeSelectionKey.current;
+      current.updateScene({ appState: { selectedElementIds: {}, selectedGroupIds: {} }, captureUpdate: CaptureUpdateAction.NEVER });
+    }
+  }, []);
+  const setSelection = useCallback((item: Selection) => {
+    if (item) clearNoteSelection();
+    setSelectedItems(item ? [item] : []);
+  }, [clearNoteSelection]);
   const [editingDimension, setEditingDimension] = useState<{ kind: "wall" | "angle" | "thickness"; id: string } | null>(null);
   const [measurementType, setMeasurementType] = useState<"length" | "thickness">("length");
   const [origin, setOrigin] = useState<Point | null>(null);
@@ -110,17 +221,25 @@ export default function App() {
   const [drag, setDragState] = useState<Drag | null>(null);
   const dragRef = useRef<Drag | null>(null);
   const lastPointer = useRef<PointerSample | null>(null);
+  const [draftGuides, setDraftGuides] = useState<SnapGuide[]>([]);
+  const [placement, setPlacement] = useState<Opening | null>(null);
+  const clearGuides = useCallback(() => {
+    setDraftGuides(current => current.length ? [] : current);
+    setPlacement(null);
+  }, []);
+  const showGuides = (guides: SnapGuide[]) => setDraftGuides(current => sameGuides(current, guides) ? current : guides);
   const setDrag = useCallback((next: Drag | null) => {
     previewFrame.cancel();
     dragRef.current = next;
     setDragState(next);
-  }, [previewFrame]);
+    if (!next) clearGuides();
+  }, [previewFrame, clearGuides]);
   useEffect(() => previewFrame.cancel, [previewFrame]);
   const dimensionWasDragged = useRef(false);
   const angleWasDragged = useRef(false);
   const wallWasDragged = useRef(false);
   const pointerTarget = useRef<"wall" | "node" | "annotation" | null>(null);
-  const [view, setView] = useState({ scrollX: 0, scrollY: 0, zoom: 1 });
+  const [view, setView] = useState({ scrollX: 0, scrollY: 0, zoom: 1, width: 0, height: 0 });
   const [snap, setSnap] = useState(true);
   const [orthogonal, setOrthogonal] = useState(true);
   const [showGrid, setShowGrid] = useState(false);
@@ -128,35 +247,42 @@ export default function App() {
   const [thickness, setThickness] = useState(150);
   const [doorWidth, setDoorWidth] = useState(900);
   const [windowWidth, setWindowWidth] = useState(1200);
-  const [past, setPast] = useState<Plan[]>([]);
-  const [future, setFuture] = useState<Plan[]>([]);
+  const [past, setPast] = useState<Snapshot[]>([]);
+  const [future, setFuture] = useState<Snapshot[]>([]);
+  const pastRef = useRef(past), futureRef = useRef(future);
   const [message, setMessage] = useState<{ text: string; error: boolean } | null>(
     initial.error ? { text: initial.error, error: true } : null,
   );
   const [editError, setEditError] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<"saved" | "saving" | "error">(initial.error ? "error" : "saved");
-  const [savedSnapshot, setSavedSnapshot] = useState<{ plan: Plan; sketches: readonly ExcalidrawElement[] } | null>(null);
+  const [savedSnapshot, setSavedSnapshot] = useState<{ plan: Plan; notes: readonly CanvasElement[]; groups: readonly ElementGroup[] } | null>(null);
   const [savePaused, setSavePaused] = useState(!!initial.error);
   const [showHelp, setShowHelp] = useState(false);
   const [pendingNew, setPendingNew] = useState(false);
   const [exporting, setExporting] = useState(false);
   const stage = useRef<HTMLDivElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
-  const initialized = useRef<ExcalidrawImperativeAPI | null>(null);
+  const initialized = useRef<CanvasApi | null>(null);
   const geometryDrag = isGeometryDrag(drag) ? drag : null;
+  const draggedItems = drag?.kind === "group" ? drag.items : null;
+  const movedNodeIds = useMemo(() => draggedItems ? getSelectionNodeIds(plan, planMembers(draggedItems))
+    : drag?.kind === "wall" ? plan.walls.filter(wall => wall.id === drag.id).flatMap(wall => [wall.a, wall.b]) : [],
+  [plan, draggedItems, drag?.kind, drag && "id" in drag ? drag.id : null]);
+  const activeGuides = snap ? drag ? "guides" in drag ? drag.guides ?? [] : [] : draftGuides : [];
   const displayPlan = geometryDrag?.preview ?? plan;
+  const displayNotes = drag?.kind === "group" ? drag.previewNotes : notes;
   const visibleSelection = useMemo(() => drag?.kind === "marquee"
-    ? marqueeItems(plan, drag, view.zoom, showDimensions)
+    ? marqueeItems(plan, notes, groups, drag, view.zoom, showDimensions)
     : drag && "press" in drag && drag.press ? drag.press.started ? drag.press.items : drag.press.initial
-    : selectedItems, [drag, plan, selectedItems, view.zoom, showDimensions]);
-  const selection = visibleSelection.length === 1 ? visibleSelection[0] : null;
+    : selectedItems, [drag, plan, notes, groups, selectedItems, view.zoom, showDimensions]);
+  const selection = visibleSelection.length === 1 && visibleSelection[0].kind !== "note" ? visibleSelection[0] : null;
   const selectedKeys = useMemo(() => new Set(visibleSelection.map(selectionKey)), [visibleSelection]);
   const selectedWallIds = useMemo(() => new Set(visibleSelection.filter(item => item.kind === "wall").map(item => item.id)), [visibleSelection]);
   const selectedNodeIds = useMemo(() => new Set(visibleSelection.filter(item => item.kind === "node").map(item => item.id)), [visibleSelection]);
   const selectedWallNodeIds = useMemo(() => new Set(displayPlan.walls.filter(wall => selectedWallIds.has(wall.id))
     .flatMap(wall => [wall.a, wall.b])), [displayPlan, selectedWallIds]);
-  const groupBounds = useMemo(() => visibleSelection.length > 1 ? selectionBounds(displayPlan, visibleSelection, showDimensions) : null,
-    [displayPlan, visibleSelection, showDimensions]);
+  const groupBounds = useMemo(() => visibleSelection.length > 1 ? editorBounds(displayPlan, displayNotes, visibleSelection, showDimensions) : null,
+    [displayPlan, displayNotes, visibleSelection, showDimensions]);
   const geometryIssues = useMemo(() => getGeometryIssues(displayPlan), [displayPlan]);
   const drawingFeedback = useMemo(() => {
     if (!origin || !pointer || !["wall", "room"].includes(tool) || distance(origin, pointer) < 1e-6) return null;
@@ -185,7 +311,10 @@ export default function App() {
   const propertyPlan = useMemo(() => dimensionPreview?.measurement === "thickness" && displayPlan.thicknessDimensions
     ? { ...displayPlan, thicknessDimensions: displayPlan.thicknessDimensions.map(dimension =>
       dimension.id === dimensionPreview.id ? { ...dimension, offset: dimensionPreview.offset } : dimension) }
-    : displayPlan, [displayPlan, dimensionPreview]);
+    : dimensionPreview?.measurement !== "thickness" && dimensionPreview
+      ? { ...displayPlan, walls: displayPlan.walls.map(wall => wall.id === dimensionPreview.id
+        ? { ...wall, dimensionOffset: dimensionPreview.offset } : wall) }
+      : displayPlan, [displayPlan, dimensionPreview]);
   const renderPlan = useMemo(() => angleDraft?.wallB && pointer
     && hasAngleGeometry(displayPlan, { wallA: angleDraft.wallA, wallB: angleDraft.wallB }) ? {
     ...displayPlan, angleDimensions: [...(displayPlan.angleDimensions ?? []), {
@@ -202,28 +331,49 @@ export default function App() {
   const geometry = useMemo(() => sceneRenderer.render(renderPlan, showDimensions, dimensionPreview, geometryIssues),
     [sceneRenderer, renderPlan, showDimensions, dimensionPreview, geometryIssues, fontRevision]);
   const dimensionLabels = useMemo(() => geometry.filter(element => element.type === "text")
-    .filter(element => element.id.startsWith("plan-dim-label-")), [geometry]);
+    .filter(element => element.id.startsWith("plan-dim-label-") || element.id.startsWith("plan-warning-length-")), [geometry]);
   const thicknessLabels = useMemo(() => geometry.filter(element => element.type === "text")
     .filter(element => element.id.startsWith("plan-thickness-label-")), [geometry]);
   const angleLabels = useMemo(() => geometry.filter(element => element.type === "text")
-    .filter(element => element.id.startsWith("plan-angle-label-")), [geometry]);
+    .filter(element => element.id.startsWith("plan-angle-label-") || element.id.startsWith("plan-warning-angle-label-")), [geometry]);
   const [initialElements] = useState(() => [...geometry, ...initial.project.sketches]);
   const geometryRef = useRef(geometry);
-  const apiRef = useRef(api);
   const rooms = useMemo(() => detectRooms(displayPlan, geometryIssues), [displayPlan, geometryIssues]);
 
   const notify = useCallback((text: string, error = false) => setMessage({ text, error }), []);
-  const commit = useCallback((change: (current: Plan) => Plan) => {
+  const unsupportedNotes = useCallback((message: string) => notify(message, true), [notify]);
+  const applySnapshot = useCallback((snapshot: Snapshot, liveNotes = structuredClone(snapshot.notes)) => {
+    committed.current = snapshot;
+    pendingNotes.current = false;
+    planRef.current = snapshot.plan;
+    notesRef.current = liveNotes;
+    notesVersionRef.current = getSceneVersion(liveNotes);
+    groupsRef.current = snapshot.groups;
+    setPlan(snapshot.plan);
+    setNotes(liveNotes);
+    setGroups(snapshot.groups);
+  }, []);
+  const commitEditor = useCallback((change: (current: Snapshot) => Snapshot) => {
     previewFrame.cancel();
     try {
-      const current = planRef.current;
-      const next = change(current);
+      const current = { plan: planRef.current, notes: notesRef.current, groups: groupsRef.current };
+      let next = change(current);
+      if (next.notes.some(note => note.groupIds.length)) {
+        const imported = parseProject(JSON.stringify(makeProject(next.plan, next.notes, next.groups)));
+        next = { ...next, notes: imported.sketches, groups: imported.groups ?? [] };
+      }
       setEditError(null);
-      if (next === current) return true;
-      setPast(history => [...history.slice(-(HISTORY_LIMIT - 1)), current]);
-      setFuture([]);
-      planRef.current = next;
-      setPlan(next);
+      const nextGroups = validateGroups(reconcileGroups(next.groups, next.plan, next.notes, current.plan), next.plan, next.notes);
+      pendingNotes.current = false;
+      if (next.plan === committed.current.plan && noteContent(next.notes) === noteContent(committed.current.notes)
+        && JSON.stringify(nextGroups) === JSON.stringify(committed.current.groups)) return true;
+      const snapshot: Snapshot = { plan: next.plan, notes: structuredClone(next.notes), groups: nextGroups };
+      if (next.notes !== current.notes) syncingProject.current = true;
+      pastRef.current = [...pastRef.current.slice(-(HISTORY_LIMIT - 1)), committed.current];
+      futureRef.current = [];
+      setPast(pastRef.current);
+      setFuture(futureRef.current);
+      applySnapshot(snapshot, next.notes);
       setAngleDraft(null);
       return true;
     } catch (error) {
@@ -231,10 +381,19 @@ export default function App() {
       setEditError(error.message);
       return false;
     }
-  }, [previewFrame]);
+  }, [applySnapshot, previewFrame]);
+  const commit = useCallback((change: (current: Plan) => Plan) =>
+    commitEditor(current => ({ ...current, plan: change(current.plan) })), [commitEditor]);
 
   const chooseTool = useCallback((next: Tool) => {
     lastPointer.current = null;
+    toolRef.current = next;
+    if (apiRef.current && apiRef.current.getAppState().activeTool.type !== canvasTool(next)) {
+      apiRef.current.setActiveTool({ type: canvasTool(next) });
+    }
+    if (next === "notes" || next === "text") {
+      setSelection(null);
+    }
     setTool(next);
     setOrigin(null);
     setDrag(null);
@@ -242,55 +401,75 @@ export default function App() {
     setEditingDimension(null);
     setAngleDraft(null);
     setEditError(null);
-  }, [setDrag]);
+  }, [setDrag, setSelection]);
 
-  const undo = useCallback(() => {
-    const previous = past.at(-1);
-    if (!previous) return;
-    const current = planRef.current;
-    setFuture(next => [current, ...next]);
-    setPast(previous => previous.slice(0, -1));
-    planRef.current = previous;
-    setPlan(previous);
+  const chooseShortcut = useCallback((key: string) => {
+    if (toolRef.current === "notes") return false;
+    const lower = key.toLowerCase();
+    const shortcut = tools.find(tool => tool.key.toLowerCase() === lower)?.id
+      ?? (lower === "t" ? "text" : lower === "h" ? "hand" : lower === "s" ? "notes" : undefined);
+    if (!shortcut) return false;
+    chooseTool(shortcut);
+    return true;
+  }, [chooseTool]);
+
+  const restoreSnapshot = useCallback((snapshot: Snapshot) => {
+    syncingProject.current = true;
+    applySnapshot(snapshot);
+    nativeSelectionKey.current = noteSelectionSignature([]);
+    clearNoteSelection();
     setSelection(null);
     setOrigin(null);
     setEditingDimension(null);
     setDrag(null);
     setAngleDraft(null);
     setEditError(null);
-  }, [past, setDrag]);
-  const redo = useCallback(() => {
-    const next = future[0];
+  }, [applySnapshot, clearNoteSelection, setDrag, setSelection]);
+  const runHistory = useCallback((forward: boolean) => {
+    const source = forward ? futureRef : pastRef;
+    const target = forward ? pastRef : futureRef;
+    const next = forward ? source.current[0] : source.current.at(-1);
     if (!next) return;
-    const current = planRef.current;
-    setPast(previous => [...previous, current]);
-    setFuture(next => next.slice(1));
-    planRef.current = next;
-    setPlan(next);
-    setSelection(null);
-    setOrigin(null);
-    setEditingDimension(null);
-    setDrag(null);
-    setAngleDraft(null);
-    setEditError(null);
-  }, [future, setDrag]);
+    source.current = forward ? source.current.slice(1) : source.current.slice(0, -1);
+    target.current = forward ? [...target.current, committed.current] : [committed.current, ...target.current];
+    setPast(pastRef.current);
+    setFuture(futureRef.current);
+    restoreSnapshot(next);
+  }, [restoreSnapshot]);
 
   useEffect(() => {
     if (!api) return;
     apiRef.current = api;
     geometryRef.current = geometry;
-    api.updateScene({ elements: [...geometry, ...sketchRef.current], captureUpdate: CaptureUpdateAction.NEVER });
+    notesVersionRef.current = getSceneVersion(displayNotes);
+    const ids = nativeNoteSelection(groups, selectedItems);
+    const state = api.getAppState();
+    const selected = Object.keys(state.selectedElementIds).filter(id => state.selectedElementIds[id]);
+    const key = noteSelectionSignature(ids);
+    const selectionChanged = noteSelectionSignature(selected) !== key || Object.keys(state.selectedGroupIds).length > 0 || state.editingGroupId !== null;
+    nativeSelectionKey.current = key;
+    expectedNativeSelection.current = selectionChanged ? key : null;
+    syncingProject.current = true;
+    api.updateScene({ elements: [...geometry, ...displayNotes],
+      ...(selectionChanged ? { appState: {
+        selectedElementIds: Object.fromEntries(ids.map(id => [id, true])), selectedGroupIds: {}, editingGroupId: null,
+      } } : {}),
+      captureUpdate: CaptureUpdateAction.NEVER });
+    syncingProject.current = false;
     if (initialized.current !== api) {
       initialized.current = api;
-      requestAnimationFrame(() => api.scrollToContent([...geometry, ...sketchRef.current], {
+      requestAnimationFrame(() => api.scrollToContent([...geometry, ...notesRef.current], {
         fitToViewport: true, viewportZoomFactor: 0.72, maxZoom: 1.1, animate: false,
       }));
     }
-  }, [api, geometry]);
+  }, [api, geometry, displayNotes, groups, selectedItems]);
 
   useEffect(() => {
     if (!api) return;
-    api.setActiveTool({ type: tool === "sketch" ? "freedraw" : "selection" });
+    if (api.getAppState().activeTool.type !== canvasTool(tool)) api.setActiveTool({ type: canvasTool(tool) });
+    if (!["select", "notes", "text"].includes(tool)) {
+      api.updateScene({ appState: { selectedElementIds: {}, selectedGroupIds: {} }, captureUpdate: CaptureUpdateAction.NEVER });
+    }
   }, [api, tool]);
 
   useEffect(() => {
@@ -298,8 +477,9 @@ export default function App() {
     setSaveState("saving");
     const timer = setTimeout(() => {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(makeProject(plan, sketches)));
-        setSavedSnapshot({ plan, sketches });
+        const snapshot = committed.current;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(makeProject(snapshot.plan, snapshot.notes, snapshot.groups)));
+        setSavedSnapshot({ plan, notes, groups });
         setSaveState("saved");
       } catch (error) {
         setSaveState("error");
@@ -307,15 +487,15 @@ export default function App() {
       }
     }, 450);
     return () => clearTimeout(timer);
-  }, [plan, sketches, savePaused, notify]);
+  }, [plan, notes, groups, savePaused, notify]);
 
   // Flush the debounce when leaving so the latest small edits are not lost.
   useEffect(() => {
     const flush = () => {
       if (savePaused) return;
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(makeProject(planRef.current, sketchRef.current)));
-        setSavedSnapshot({ plan: planRef.current, sketches: sketchRef.current });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(makeProject(planRef.current, notesRef.current, groupsRef.current)));
+        setSavedSnapshot({ plan: planRef.current, notes: notesRef.current, groups: groupsRef.current });
         setSaveState("saved");
       } catch (error) {
         setSaveState("error");
@@ -357,14 +537,41 @@ export default function App() {
     return () => window.removeEventListener("keydown", onModalKey);
   }, [showHelp, pendingNew]);
 
-  const onSceneChange = useCallback((elements: readonly ExcalidrawElement[], state: AppState) => {
+  const onSceneChange = useCallback((elements: readonly CanvasElement[], state: CanvasState) => {
     setView(current => current.scrollX === state.scrollX && current.scrollY === state.scrollY
-      && current.zoom === state.zoom.value ? current
-      : { scrollX: state.scrollX, scrollY: state.scrollY, zoom: state.zoom.value });
-    const unsupported = elements.some(e => !isPlanElement(e) && !e.isDeleted && !SUPPORTED_SKETCH_TYPES.has(e.type));
-    const notes = elements.filter(e => !isPlanElement(e) && !e.isDeleted && SUPPORTED_SKETCH_TYPES.has(e.type));
-    if (unsupported) notify("The sketch layer supports shapes, text, and freehand strokes, not images, frames, or embedded content.", true);
-    // Excalidraw can unlock shapes; measured geometry is always owned by the plan.
+      && current.zoom === state.zoom.value && current.width === state.width && current.height === state.height ? current
+      : { scrollX: state.scrollX, scrollY: state.scrollY, zoom: state.zoom.value, width: state.width, height: state.height });
+    // Old canvas data must not overwrite a project snapshot while it is being applied.
+    if (syncingProject.current) return;
+    const unsupported = elements.some(e => !isPlanElement(e) && !e.isDeleted && !SUPPORTED_NOTE_TYPES.has(e.type));
+    const notes = elements.filter(e => !isPlanElement(e) && !e.isDeleted && SUPPORTED_NOTE_TYPES.has(e.type));
+    const selected = notes.filter(element => state.selectedElementIds[element.id]).map(element => element.id);
+    const selectionSignature = noteSelectionSignature(selected);
+    if (expectedNativeSelection.current !== null) {
+      if (expectedNativeSelection.current === selectionSignature) {
+        nativeSelectionKey.current = selectionSignature;
+        expectedNativeSelection.current = null;
+      }
+    } else if (nativeSelectionKey.current !== selectionSignature) {
+      nativeSelectionKey.current = selectionSignature;
+      if (!dragRef.current) {
+        const items: SelectionItem[] = selected.map(id => ({ kind: "note", id }));
+        const combined = addSelections(nativeSelectionBase.current, items);
+        setSelectedItems(nativeIndividual.current ? combined : expandGroups(groupsRef.current, combined));
+      }
+    }
+    if (editingTextRef.current && !state.editingTextElement && toolRef.current === "text") {
+      queueMicrotask(() => { if (toolRef.current === "text") chooseTool("select"); });
+    } else if (toolRef.current === "text" && !state.editingTextElement && state.activeTool.type !== "text") {
+      queueMicrotask(() => {
+        if (toolRef.current === "text" && apiRef.current?.getAppState().activeTool.type !== "text") {
+          apiRef.current?.setActiveTool({ type: "text" });
+        }
+      });
+    }
+    editingTextRef.current = !!state.editingTextElement;
+    if (unsupported) notify("Renovation notes support text, arrows, and drawing marks, not images, frames, or embedded content.", true);
+    // Measured geometry is owned by the plan, never by annotation edits.
     const measured = elements.filter(e => isPlanElement(e) && !e.isDeleted);
     if (apiRef.current && initialized.current === apiRef.current
       && (unsupported || measured.length !== geometryRef.current.length || measured.some((element, i) => {
@@ -374,42 +581,49 @@ export default function App() {
           || element.height !== source.height || element.angle !== source.angle;
       }))) {
       queueMicrotask(() => apiRef.current?.updateScene({
-        elements: [...geometryRef.current, ...sketchRef.current], captureUpdate: CaptureUpdateAction.NEVER,
+        elements: [...geometryRef.current, ...notesRef.current], captureUpdate: CaptureUpdateAction.NEVER,
       }));
     }
-    if (getSceneVersion(notes) !== getSceneVersion(sketchRef.current)
-      || notes.map(e => e.id).join() !== sketchRef.current.map(e => e.id).join()) {
-      sketchRef.current = notes;
-      setSketches(notes);
+    // The engine mutates elements in place, so retain the previous numeric version separately.
+    const notesVersion = getSceneVersion(notes);
+    if (notesVersion !== notesVersionRef.current
+      || notes.map(e => e.id).join() !== notesRef.current.map(e => e.id).join()) {
+      notesRef.current = notes;
+      notesVersionRef.current = notesVersion;
+      pendingNotes.current = true;
+      setNotes(notes);
     }
-  }, [notify]);
+    if (pendingNotes.current && state.cursorButton === "up" && !state.editingTextElement && !state.newElement
+      && !state.multiElement && !state.isResizing && !state.isRotating && !dragRef.current) {
+      const adoptedGroup = notes.some(note => note.groupIds.length);
+      if (commitEditor(current => ({ ...current, notes })) && adoptedGroup) {
+        queueMicrotask(() => {
+          chooseTool("select");
+          setSelectedItems(expandGroups(groupsRef.current, selected.map(id => ({ kind: "note", id }))));
+        });
+      }
+    }
+  }, [notify, chooseTool, setSelectedItems, commitEditor]);
 
   const saveProject = useCallback(() => {
     const current = planRef.current;
-    downloadFile(JSON.stringify(makeProject(current, sketchRef.current), null, 2), "application/json",
+    downloadFile(JSON.stringify(makeProject(current, notesRef.current, groupsRef.current), null, 2), "application/json",
       `${current.name.replace(/[<>:"/\\|?*]/g, "-") || "My floor plan"}.homedraw.json`);
-    notify("Project downloaded, including your sketch layer.");
+    notify("Project downloaded, including renovation notes.");
   }, [notify]);
 
-  const removeNode = useCallback((nodeId: string) => {
+  const removeItems = useCallback((items: readonly SelectionItem[]) => {
     setDrag(null);
     setEditingDimension(null);
-    if (commit(current => deleteNode(current, nodeId))) {
+    const ids = new Set(noteMemberIds(items));
+    if (commitEditor(current => ({ ...current, plan: deleteSelection(current.plan, planMembers(items)),
+      notes: current.notes.filter(note => !ids.has(note.id)) }))) {
       setSelection(null);
       setOrigin(null);
       setAngleDraft(null);
     }
-  }, [commit, setDrag]);
-
-  const removeSelected = useCallback(() => {
-    setDrag(null);
-    setEditingDimension(null);
-    if (commit(current => deleteSelection(current, visibleSelection))) {
-      setSelection(null);
-      setOrigin(null);
-      setAngleDraft(null);
-    }
-  }, [commit, setDrag, setSelection, visibleSelection]);
+  }, [commitEditor, setDrag, setSelection]);
+  const removeSelected = useCallback(() => removeItems(visibleSelection), [removeItems, visibleSelection]);
 
   const addThickness = (wallId: string, offset?: number) => {
     setDrag(null);
@@ -425,56 +639,79 @@ export default function App() {
     }
   };
 
+  const changeGrouping = useCallback((ungroup: boolean) => {
+    const items = selectionRef.current;
+    let members = items;
+    if (commitEditor(current => {
+      const next = ungroup ? ungroupSelection(current.groups, items) : groupSelection(current.groups, current.plan, current.notes, items);
+      if (!ungroup) {
+        const created = next.find(group => !current.groups.some(previous => previous.id === group.id));
+        if (created) members = created.members;
+      }
+      return { ...current, groups: next };
+    })) {
+      chooseTool("select");
+      setSelectedItems(expandGroups(groupsRef.current, members));
+    }
+  }, [chooseTool, commitEditor, setSelectedItems]);
+  const selectAll = useCallback(() => {
+    const notesOnly = toolRef.current === "notes";
+    const items = expandGroups(groupsRef.current, [
+      ...(notesOnly ? [] : planRef.current.walls.map(wall => ({ kind: "wall" as const, id: wall.id }))),
+      ...notesRef.current.map(note => ({ kind: "note" as const, id: note.id })),
+    ]);
+    if (!notesOnly || selectedGroups(groupsRef.current, items).length) chooseTool("select");
+    setSelectedItems(items);
+  }, [chooseTool, setSelectedItems]);
+
+  const onKeyDown = useCallback((event: KeyboardEvent) => {
+    if (event.defaultPrevented) return false;
+    const key = event.key.toLowerCase(), command = event.ctrlKey || event.metaKey;
+    if (command && key === "s" && !showHelp && !pendingNew) {
+      event.preventDefault();
+      saveProject();
+      return true;
+    }
+    if (isEditableTarget(event.target) || showHelp || pendingNew) return false;
+    if (command && ["z", "y"].includes(key)) {
+      event.preventDefault();
+      runHistory(event.shiftKey || key === "y");
+      return true;
+    }
+    if (command && key === "g") {
+      event.preventDefault();
+      changeGrouping(event.shiftKey);
+      return true;
+    }
+    if (key === "escape" && tool !== "notes") {
+      event.preventDefault();
+      if (dragRef.current?.kind === "marquee") { setDrag(null); return true; }
+      chooseTool("select");
+      setSelection(null);
+      return true;
+    }
+    if (command && key === "a") {
+      event.preventDefault();
+      selectAll();
+      return true;
+    }
+    if (!command && !event.altKey) {
+      if (chooseShortcut(key)) { event.preventDefault(); return true; }
+      if (["delete", "backspace"].includes(key) && visibleSelection.length) {
+        event.preventDefault();
+        if (selection?.kind === "room") { setDrag(null); setEditingDimension(null); setSelection(null); }
+        else removeSelected();
+        return true;
+      }
+    }
+    return false;
+  }, [chooseTool, chooseShortcut, changeGrouping, selectAll, pendingNew, runHistory, removeSelected, saveProject, selection, setDrag, setSelection, showHelp, tool, visibleSelection]);
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.target instanceof HTMLElement && (event.target.closest("input,textarea,select,[contenteditable=true]")
-        || showHelp || pendingNew)) return;
-      if (event.key === "Escape") {
-        if (dragRef.current?.kind === "marquee") { setDrag(null); return; }
-        chooseTool("select");
-        setSelection(null);
-        return;
-      }
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        saveProject();
-        return;
-      }
-      if (tool === "sketch") return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
-        event.preventDefault();
-        chooseTool("select");
-        setSelectedItems(planRef.current.walls.map(wall => ({ kind: "wall", id: wall.id })));
-        return;
-      }
-      if ((event.ctrlKey || event.metaKey) && ["z", "y"].includes(event.key.toLowerCase())) {
-        event.preventDefault();
-        if (event.shiftKey || event.key.toLowerCase() === "y") redo(); else undo();
-      } else if (!event.ctrlKey && !event.metaKey && !event.altKey) {
-        const shortcut = tools.find(t => t.key.toLowerCase() === event.key.toLowerCase());
-        if (shortcut) { event.preventDefault(); chooseTool(shortcut.id); }
-        if (event.key.toLowerCase() === "h") chooseTool("hand");
-        if (event.key.toLowerCase() === "s") chooseTool("sketch");
-        if (["Delete", "Backspace"].includes(event.key) && visibleSelection.length) {
-          event.preventDefault();
-          if (visibleSelection.length > 1) { removeSelected(); return; }
-          if (!selection) return;
-          if (selection.kind === "node") { removeNode(selection.id); return; }
-          setDrag(null);
-          setEditingDimension(null);
-          const applied = selection.kind === "wall" ? commit(p => deleteWall(p, selection.id))
-            : selection.kind === "angle" ? commit(p => deleteAngleDimension(p, selection.id))
-            : selection.kind === "thickness" ? commit(p => deleteThicknessDimension(p, selection.id))
-            : selection.kind === "room" || commit(p => deleteOpening(p, selection.id));
-          if (applied) setSelection(null);
-        }
-      }
-    };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [chooseTool, commit, pendingNew, redo, removeNode, removeSelected, saveProject, selection, setDrag, setSelection, showHelp, tool, undo, visibleSelection]);
+  }, [onKeyDown]);
 
-  const fit = () => api?.scrollToContent([...geometryRef.current, ...sketchRef.current], {
+  const fit = () => api?.scrollToContent([...geometryRef.current, ...notesRef.current], {
     fitToViewport: true, viewportZoomFactor: 0.72, maxZoom: 1.5, animate: false,
   });
   const zoom = (factor: number, at?: Point) => {
@@ -483,32 +720,34 @@ export default function App() {
     const next = Math.min(3, Math.max(0.2, state.zoom.value * factor));
     const center = at ?? { x: stage.current.clientWidth / 2, y: stage.current.clientHeight / 2 };
     api.updateScene({ appState: {
-      zoom: { value: next as AppState["zoom"]["value"] },
+      zoom: { value: next as CanvasState["zoom"]["value"] },
       scrollX: state.scrollX + center.x / next - center.x / state.zoom.value,
       scrollY: state.scrollY + center.y / next - center.y / state.zoom.value,
     }, captureUpdate: CaptureUpdateAction.NEVER });
   };
-  const toWorld = (event: { clientX: number; clientY: number }): Point => {
+  const toWorld = useCallback((event: { clientX: number; clientY: number }): Point => {
     const bounds = stage.current!.getBoundingClientRect();
-    const state = api!.getAppState();
+    const state = apiRef.current!.getAppState();
     return {
       x: ((event.clientX - bounds.left) / state.zoom.value - state.scrollX) / SCALE,
       y: ((event.clientY - bounds.top) / state.zoom.value - state.scrollY) / SCALE,
     };
-  };
-  const snapped = (point: Point, altKey: boolean, shiftKey: boolean) => snapPoint(
+  }, []);
+  const snapped = (point: Point, altKey: boolean, shiftKey: boolean) => snapDraftPoint(
     plan, point, snap && !altKey ? 50 : 0, snap && !altKey ? 12 / (SCALE * view.zoom) : 0,
     tool === "wall" ? origin ?? undefined : undefined,
     tool === "wall" && (orthogonal || shiftKey),
   );
-  const draftPoint = (point: Point, altKey: boolean, shiftKey: boolean) => {
+  const draftPoint = (point: Point, altKey: boolean, shiftKey: boolean, preview = true) => {
     try {
       const next = snapped(point, altKey, shiftKey);
       setEditError(null);
-      return next;
+      if (preview) showGuides(next.guides);
+      return next.point;
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       setEditError(error.message);
+      clearGuides();
       return null;
     }
   };
@@ -523,22 +762,50 @@ export default function App() {
   };
   const geometryDragAt = (movement: GeometryDrag, current: Point, altKey: boolean, shiftKey: boolean): GeometryDrag => {
     const nearStart = distance(movement.start, current) * SCALE * view.zoom <= 3;
+    const enabled = snap && !altKey;
+    const movingIds = movement.kind === "group" && movement.items !== draggedItems
+      ? getSelectionNodeIds(plan, planMembers(movement.items))
+      : movement.kind === "wall" && (drag?.kind !== "wall" || movement.id !== drag.id)
+        ? plan.walls.filter(wall => wall.id === movement.id).flatMap(wall => [wall.a, wall.b]) : movedNodeIds;
+    const translate = () => {
+      const delta = { x: current.x - movement.start.x, y: current.y - movement.start.y };
+      return snapTranslation(plan, movingIds, delta, enabled ? 50 : 0, enabled ? 10 / (SCALE * view.zoom) : 0,
+        shiftKey ? Math.abs(delta.x) >= Math.abs(delta.y) ? "x" : "y" : undefined);
+    };
     if (movement.kind === "group") {
-      const movesGeometry = movement.items.some(item => item.kind === "wall" || item.kind === "node" || item.kind === "room");
-      let delta = deltaFor(movement.start, current, altKey, shiftKey && movesGeometry);
-      if (nearStart) delta = { x: 0, y: 0 };
-      if (delta.x === 0 && delta.y === 0) return { ...movement, current, delta, base: plan, preview: plan, error: null };
-      if (movement.base === plan && delta.x === movement.delta.x && delta.y === movement.delta.y) return { ...movement, current, error: null };
+      if (nearStart) return { ...movement, current, delta: { x: 0, y: 0 }, base: plan, preview: plan,
+        previewNotes: movement.baseNotes, error: null, guides: [] };
       try {
-        return { ...movement, current, delta, base: plan, preview: moveSelection(plan, movement.items, delta), error: null };
+        let delta: Point, guides: SnapGuide[] = [];
+        if (movingIds.length) {
+          ({ delta, guides } = translate());
+        } else if (movement.items.length === 1 && ["door", "window"].includes(movement.items[0].kind)) {
+          const opening = plan.openings.find(opening => opening.id === movement.items[0].id)!;
+          const wall = plan.walls.find(wall => wall.id === opening.wallId)!;
+          const [a, b] = wallPoints(plan, wall), length = distance(a, b);
+          if (length < 1) throw new Error("Move the wall's junctions apart before moving its opening.");
+          const axis = { x: (b.x - a.x) / length, y: (b.y - a.y) / length };
+          const rawOffset = draggedDimensionOffset(opening.offset, axis, movement.start, current);
+          const result = snapOpeningPosition(plan, wall, rawOffset, enabled ? 50 : 0, enabled ? 10 / (SCALE * view.zoom) : 0, [opening.id]);
+          delta = { x: axis.x * (result.offset - opening.offset), y: axis.y * (result.offset - opening.offset) };
+          guides = result.guides;
+        } else {
+          delta = deltaFor(movement.start, current, altKey || !planMembers(movement.items).length,
+            shiftKey && noteMemberIds(movement.items).length > 0);
+        }
+        if (delta.x === 0 && delta.y === 0) return { ...movement, current, delta, base: plan, preview: plan,
+          previewNotes: movement.baseNotes, error: null, guides };
+        if (movement.base === plan && delta.x === movement.delta.x && delta.y === movement.delta.y) return { ...movement, current, error: null, guides };
+        return { ...movement, current, delta, base: plan, preview: moveSelection(plan, planMembers(movement.items), delta),
+          previewNotes: movedNotes(movement.baseNotes, movement.items, delta), error: null, guides };
       } catch (error) {
         if (!(error instanceof Error)) throw error;
-        return { ...movement, current, error: error.message };
+        return { ...movement, current, error: error.message, guides: [] };
       }
     }
     const next = { ...movement, current, hasMoved: movement.hasMoved || !nearStart };
     if (nearStart && (movement.kind !== "node" || !next.hasMoved)) {
-      return { ...next, preview: plan, error: null, mergeTarget: undefined };
+      return { ...next, preview: plan, error: null, mergeTarget: undefined, guides: [] };
     }
     try {
       if (movement.kind === "angle") {
@@ -546,36 +813,39 @@ export default function App() {
         const { axis } = anglePosition(plan, angle);
         const offset = draggedDimensionOffset(angle.radius, axis, movement.start, current);
         const radius = Math.abs(offset - angle.radius) * SCALE * view.zoom <= 3 ? angle.radius : Math.max(100, offset);
+        const position = anglePosition(plan, { ...angle, radius });
+        const guides: SnapGuide[] = enabled
+          ? [{ id: `angle:${angle.id}`, kind: "constraint", a: position.vertex, b: position.label }] : [];
         if (radius === movement.preview.angleDimensions!.find(angle => angle.id === movement.id)!.radius) {
-          return { ...next, error: null };
+          return { ...next, error: null, guides };
         }
-        return { ...next, preview: updateAngleDimension(plan, angle.id, { radius }), error: null };
+        return { ...next, preview: updateAngleDimension(plan, angle.id, { radius }), error: null, guides };
       }
       if (movement.kind === "node") {
         const node = plan.nodes.find(node => node.id === movement.id)!;
         const target = { x: node.x + current.x - movement.start.x, y: node.y + current.y - movement.start.y };
-        const position = snapPoint(nodeSnapPlan, target, snap && !altKey ? 50 : 0,
-          snap && !altKey ? 10 / (SCALE * view.zoom) : 0, shiftKey ? node : undefined, shiftKey);
+        const { point: position, guides } = snapDraftPoint(nodeSnapPlan, target, enabled ? 50 : 0,
+          enabled ? 10 / (SCALE * view.zoom) : 0, shiftKey ? node : undefined, shiftKey);
         let mergeTarget: string | undefined;
         if (snap && !altKey) for (const candidate of nodeSnapPlan.nodes) {
           if (distance(candidate, position) <= 1e-6) mergeTarget = candidate.id;
         }
-        if (nearStart && !mergeTarget) return { ...next, preview: plan, error: null, mergeTarget: undefined };
+        if (nearStart && !mergeTarget) return { ...next, preview: plan, error: null, mergeTarget: undefined, guides: [] };
         const previous = movement.preview.nodes.find(node => node.id === movement.id)!;
-        if (position.x === previous.x && position.y === previous.y) return { ...next, error: null, mergeTarget };
-        return { ...next, preview: moveNode(plan, movement.id, position), error: null, mergeTarget };
+        if (position.x === previous.x && position.y === previous.y) return { ...next, error: null, mergeTarget, guides };
+        return { ...next, preview: moveNode(plan, movement.id, position), error: null, mergeTarget, guides };
       }
-      const delta = deltaFor(movement.start, current, altKey, shiftKey);
-      if (delta.x === 0 && delta.y === 0) return { ...next, preview: plan, error: null };
+      const { delta, guides } = translate();
+      if (delta.x === 0 && delta.y === 0) return { ...next, preview: plan, error: null, guides };
       const wall = plan.walls.find(wall => wall.id === movement.id)!;
       const start = plan.nodes.find(node => node.id === wall.a)!;
       const previous = movement.preview.nodes.find(node => node.id === wall.a)!;
-      if (start.x + delta.x === previous.x && start.y + delta.y === previous.y) return { ...next, error: null };
-      return { ...next, preview: moveWall(plan, movement.id, delta), error: null };
+      if (start.x + delta.x === previous.x && start.y + delta.y === previous.y) return { ...next, error: null, guides };
+      return { ...next, preview: moveWall(plan, movement.id, delta), error: null, guides };
     } catch (error) {
       if (!(error instanceof Error)) throw error;
       // Only malformed or out-of-range input is blocked; spatial conflicts remain editable.
-      return { ...next, error: error.message, mergeTarget: undefined };
+      return { ...next, error: error.message, mergeTarget: undefined, guides: [] };
     }
   };
   const rememberPointer = ({ clientX, clientY, altKey, shiftKey }: PointerSample) => {
@@ -584,12 +854,13 @@ export default function App() {
     return sample;
   };
   const startItemDrag = (event: ReactPointerEvent<SVGElement>, movement: ItemDrag, item?: SelectionItem,
-    items = item ? [item] : visibleSelection) => {
+    items = item ? [item] : visibleSelection, toggled?: SelectionItem[]) => {
+    clearNoteSelection();
     rememberPointer(event);
     setEditingDimension(null);
     setEditError(null);
     const press = event.shiftKey && tool === "select" && item
-      ? { item, initial: selectedItems, items, started: false } : undefined;
+      ? { item, initial: selectedItems, items, toggle: toggled, started: false } : undefined;
     if (!press) setSelectedItems(items);
     setDrag({ ...movement, press });
   };
@@ -597,7 +868,7 @@ export default function App() {
     if (!movement.press || movement.press.started || distance(movement.start, point) * SCALE * view.zoom <= 3) return movement;
     return { ...movement, press: { ...movement.press, started: true } };
   };
-  const startGroupDrag = (event: ReactPointerEvent<SVGElement>, items = visibleSelection, item?: SelectionItem) => {
+  const startGroupDrag = (event: ReactPointerEvent<SVGElement>, items = visibleSelection, item?: SelectionItem, toggled?: SelectionItem[]) => {
     event.preventDefault();
     event.stopPropagation();
     const canvas = event.currentTarget instanceof SVGSVGElement ? event.currentTarget : event.currentTarget.ownerSVGElement!;
@@ -606,11 +877,23 @@ export default function App() {
     pointerTarget.current = null;
     wallWasDragged.current = dimensionWasDragged.current = angleWasDragged.current = true;
     const start = toWorld(event);
-    startItemDrag(event, { kind: "group", items, start, current: start, base: plan, preview: plan, error: null, delta: { x: 0, y: 0 } }, item, items);
+    startItemDrag(event, { kind: "group", items, start, current: start, base: plan, preview: plan,
+      baseNotes: notesRef.current, previewNotes: notesRef.current, error: null, delta: { x: 0, y: 0 } }, item, items, toggled);
+  };
+  const startGroupedItem = (event: ReactPointerEvent<SVGElement>, item: SelectionItem) => {
+    if (event.ctrlKey || event.metaKey) { enteredMember.current = selectionKey(item); return false; }
+    if (enteredMember.current === selectionKey(item)) return false;
+    const members = membersAt(plan, groups, item);
+    if (members.length <= 1) return false;
+    const included = members.every(member => selectedKeys.has(selectionKey(member)));
+    const items = event.shiftKey ? addSelections(visibleSelection, members) : included ? visibleSelection : members;
+    startGroupDrag(event, items, item, members);
+    return true;
   };
   const startNodeDrag = (event: ReactPointerEvent<SVGGElement>, nodeId: string) => {
     if (!api || event.button !== 0) return;
-    if (visibleSelection.length > 1 && (selectedNodeIds.has(nodeId) || selectedWallNodeIds.has(nodeId))) {
+    if (startGroupedItem(event, { kind: "node", id: nodeId })) return;
+    if (!event.ctrlKey && !event.metaKey && visibleSelection.length > 1 && (selectedNodeIds.has(nodeId) || selectedWallNodeIds.has(nodeId))) {
       startGroupDrag(event, visibleSelection, { kind: "node", id: nodeId }); return;
     }
     pointerTarget.current = "node";
@@ -626,12 +909,15 @@ export default function App() {
     if (event.button !== 0 || !api) return;
     const thickness = measurement === "thickness" ? plan.thicknessDimensions!.find(dimension => dimension.id === id) : undefined;
     const wall = plan.walls.find(w => w.id === (thickness?.wallId ?? id))!;
-    const item: SelectionItem = { kind: measurement === "thickness" ? "thickness" : "wall", id };
-    if (tool === "select" && visibleSelection.length > 1 && (selectedWallIds.has(wall.id) || selectedKeys.has(selectionKey(item)))) {
+    const item: SelectionItem = { kind: measurement === "thickness" ? "thickness" : "dimension", id };
+    if (startGroupedItem(event, item)) return;
+    if (!event.ctrlKey && !event.metaKey && tool === "select" && visibleSelection.length > 1 && (selectedWallIds.has(wall.id) || selectedKeys.has(selectionKey(item)))) {
       startGroupDrag(event, visibleSelection, item); return;
     }
     pointerTarget.current = "annotation";
     event.stopPropagation();
+    const canvas = event.currentTarget instanceof SVGSVGElement ? event.currentTarget : event.currentTarget.ownerSVGElement!;
+    canvas.focus({ preventScroll: true });
     dimensionWasDragged.current = false;
     if (isWallDegenerate(plan, wall)) {
       setDrag(null);
@@ -645,8 +931,9 @@ export default function App() {
   };
   const startAngleDrag = (event: ReactPointerEvent<SVGElement>, angleId: string) => {
     if (!api || event.button !== 0) return;
+    if (startGroupedItem(event, { kind: "angle", id: angleId })) return;
     const angle = plan.angleDimensions!.find(angle => angle.id === angleId)!;
-    if (visibleSelection.length > 1 && (selectedKeys.has(`angle:${angleId}`)
+    if (!event.ctrlKey && !event.metaKey && visibleSelection.length > 1 && (selectedKeys.has(`angle:${angleId}`)
       || selectedWallIds.has(angle.wallA) || selectedWallIds.has(angle.wallB))) {
       startGroupDrag(event, visibleSelection, { kind: "angle", id: angleId }); return;
     }
@@ -655,6 +942,13 @@ export default function App() {
     event.stopPropagation();
     const canvas = event.currentTarget.ownerSVGElement!;
     canvas.focus({ preventScroll: true });
+    if (!hasAngleGeometry(plan, angle)) {
+      setDrag(null);
+      setEditError(null);
+      const item: SelectionItem = { kind: "angle", id: angleId };
+      if (event.shiftKey) setSelectedItems(current => toggleSelection(current, item)); else setSelection(item);
+      return;
+    }
     event.currentTarget.setPointerCapture(event.pointerId);
     angleWasDragged.current = false;
     const start = toWorld(event);
@@ -664,8 +958,31 @@ export default function App() {
     const offset = draggedDimensionOffset(movement.initialOffset, movement.axis, movement.start, point);
     return Math.abs(offset - movement.initialOffset) * SCALE * view.zoom > 3 ? offset : movement.initialOffset;
   };
+  const dimensionGuides = (movement: DimensionDrag, offset: number, altKey: boolean): SnapGuide[] => {
+    if (!snap || altKey || offset === movement.initialOffset) return [];
+    const dimension = movement.measurement === "thickness"
+      ? plan.thicknessDimensions!.find(dimension => dimension.id === movement.id) : undefined;
+    const wall = plan.walls.find(wall => wall.id === (dimension?.wallId ?? movement.id))!;
+    const at = (offset: number) => dimension ? thicknessDimensionPosition(plan, { ...dimension, offset }).label
+      : dimensionPosition(plan, { ...wall, dimensionOffset: offset }).label;
+    return [{ id: `dimension:${movement.id}`, kind: "constraint", a: at(movement.initialOffset), b: at(offset) }];
+  };
+  const placementAt = (raw: Point, altKey: boolean) => {
+    const hit = nearestWall(plan, raw, 18 / (SCALE * view.zoom));
+    if (!hit) return null;
+    const enabled = snap && !altKey;
+    if (tool === "dimension" && measurementType === "length") {
+      const [a, b] = wallPoints(plan, hit.wall);
+      const guides: SnapGuide[] = enabled && !isWallDegenerate(plan, hit.wall)
+        ? [{ id: `wall:${hit.wall.id}`, kind: "wall", a, b, target: hit.point }] : [];
+      return { wall: hit.wall, offset: hit.offset, point: hit.point, guides };
+    }
+    return { wall: hit.wall, ...snapOpeningPosition(plan, hit.wall, hit.offset,
+      enabled ? 50 : 0, enabled ? 10 / (SCALE * view.zoom) : 0) };
+  };
   const onPointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     if (!api || (event.button !== 0 && event.button !== 1)) return;
+    clearNoteSelection();
     rememberPointer(event);
     pointerTarget.current = null;
     setEditError(null);
@@ -681,10 +998,11 @@ export default function App() {
       event.currentTarget.focus({ preventScroll: true });
       const point = toWorld(event);
       const hit = hitTest(plan, point, 12 / (SCALE * view.zoom), showDimensions);
+      if (hit && startGroupedItem(event, hit)) return;
       const padding = 8 / (SCALE * view.zoom);
       const inGroup = groupBounds && point.x >= groupBounds.x - padding && point.x <= groupBounds.x + groupBounds.width + padding
         && point.y >= groupBounds.y - padding && point.y <= groupBounds.y + groupBounds.height + padding;
-      if (visibleSelection.length > 1 && (hit && selectedKeys.has(selectionKey(hit))
+      if (!event.ctrlKey && !event.metaKey && visibleSelection.length > 1 && (hit && selectedKeys.has(selectionKey(hit))
         || !event.shiftKey && (!hit || hit.kind === "room") && inGroup
         || hit && (hit.kind === "door" || hit.kind === "window") && selectedWallIds.has(plan.openings.find(opening => opening.id === hit.id)!.wallId))) {
         startGroupDrag(event, visibleSelection, hit ?? undefined); return;
@@ -695,6 +1013,7 @@ export default function App() {
         return;
       }
       if (hit.kind === "thickness") { startDimensionDrag(event, hit.id, "thickness"); return; }
+      if (hit.kind === "dimension") { startDimensionDrag(event, hit.id); return; }
       if (hit.kind === "door" || hit.kind === "window") { startGroupDrag(event, [hit], hit); return; }
       if (hit?.kind === "wall" && nearestWall(plan, point, 12 / (SCALE * view.zoom))?.wall.id === hit.id) {
         setEditingDimension(null);
@@ -727,7 +1046,7 @@ export default function App() {
   };
   const updatePointerPreview = ({ clientX, clientY, altKey, shiftKey }: PointerSample) => {
     if (!api) return;
-    if (!dragRef.current && !["wall", "room", "angle"].includes(tool)) return;
+    if (!dragRef.current && !["wall", "room", "angle", "door", "window", "dimension"].includes(tool)) return;
     let movement = dragRef.current;
     if (movement?.kind === "pan") {
       const client = shiftKey ? constrainToAxis({ x: clientX, y: clientY }, movement.client) : { x: clientX, y: clientY };
@@ -746,26 +1065,48 @@ export default function App() {
       if (point.x !== movement.current.x || point.y !== movement.current.y) setDrag({ ...movement, current: point });
     } else if (movement?.kind === "dimension") {
       const offset = dimensionOffsetAt(movement, point);
-      if (offset !== movement.offset || movement !== dragRef.current) setDrag({ ...movement, offset });
+      const guides = dimensionGuides(movement, offset, altKey);
+      if (offset !== movement.offset || movement !== dragRef.current || !sameGuides(movement.guides, guides)) setDrag({ ...movement, offset, guides });
     } else if (isGeometryDrag(movement)) {
       const next = geometryDragAt(movement, point, altKey, shiftKey);
-      if (movement !== dragRef.current || next.preview !== movement.preview || next.error !== movement.error
+      if (movement !== dragRef.current || next.preview !== movement.preview || next.error !== movement.error || !sameGuides(next.guides, movement.guides)
         || next.kind !== "group" && movement.kind !== "group"
         && (next.mergeTarget !== movement.mergeTarget || next.hasMoved !== movement.hasMoved)) setDrag(next);
+    } else if (tool === "door" || tool === "window" || tool === "dimension") {
+      try {
+        const hit = placementAt(point, altKey);
+        showGuides(hit?.guides ?? []);
+        setEditError(null);
+        if (hit && (tool === "door" || tool === "window")) {
+          const width = tool === "door" ? doorWidth : windowWidth;
+          setPlacement(previous => previous?.wallId === hit.wall.id && previous.offset === hit.offset
+            && previous.kind === tool && previous.width === width ? previous
+            : { id: "preview-opening", wallId: hit.wall.id, offset: hit.offset, width, kind: tool, flip: false });
+        } else setPlacement(null);
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        clearGuides();
+        setEditError(error.message);
+      }
     } else {
       const next = tool === "angle" ? point : draftPoint(point, altKey, shiftKey) ?? point;
+      if (tool === "angle" && angleDraft?.wallB && hasAngleGeometry(plan, { wallA: angleDraft.wallA, wallB: angleDraft.wallB })) {
+        const angle = { ...angleDimensionAt(plan, angleDraft.wallA, angleDraft.wallB, next), id: ANGLE_PREVIEW_ID };
+        const position = anglePosition(plan, angle);
+        showGuides(snap && !altKey ? [{ id: "angle-placement", kind: "constraint", a: position.vertex, b: position.label }] : []);
+      }
       setPointer(previous => previous?.x === next.x && previous.y === next.y ? previous : next);
     }
   };
-  const onPointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
-    if (!api || !dragRef.current && !["wall", "room", "angle"].includes(tool)) return;
+  const onPointerMove = (event: ReactPointerEvent<SVGSVGElement | HTMLDivElement>) => {
+    if (!api || !dragRef.current && !["wall", "room", "angle", "door", "window", "dimension"].includes(tool)) return;
     const sample = rememberPointer(event);
     previewFrame.schedule(() => updatePointerPreview(sample));
   };
   useEffect(() => {
     const onModifier = (event: KeyboardEvent) => {
-      if (!["Shift", "Alt"].includes(event.key) || tool === "sketch" || showHelp || pendingNew
-        || event.target instanceof HTMLElement && event.target.closest("input,textarea,select,[contenteditable=true]")) return;
+      if (!["Shift", "Alt"].includes(event.key) || tool === "notes" || showHelp || pendingNew
+        || isEditableTarget(event.target)) return;
       const previous = lastPointer.current;
       if (!previous || previous.shiftKey === event.shiftKey && previous.altKey === event.altKey) return;
       const sample = rememberPointer({ ...previous, shiftKey: event.shiftKey, altKey: event.altKey });
@@ -781,10 +1122,11 @@ export default function App() {
       window.removeEventListener("blur", onBlur);
     };
   }, [tool, showHelp, pendingNew, previewFrame, setDrag, updatePointerPreview]);
-  const onPointerUp = (event: ReactPointerEvent<SVGSVGElement>) => {
+  const onPointerUp = (event: ReactPointerEvent<SVGSVGElement | HTMLDivElement>) => {
     if (!api || dragRef.current?.kind === "dimension" && event.button !== 0) return;
-    rememberPointer(event);
+    lastPointer.current = null;
     previewFrame.cancel();
+    clearGuides();
     let movement = dragRef.current;
     const releasePoint = toWorld(event);
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
@@ -792,7 +1134,7 @@ export default function App() {
       movement = activatePress(movement, releasePoint);
       if (movement.press) {
         if (!movement.press.started) {
-          setSelectedItems(toggleSelection(movement.press.initial, movement.press.item));
+          setSelectedItems(toggleSelections(movement.press.initial, movement.press.toggle ?? [movement.press.item]));
           setDrag(null);
           return;
         }
@@ -801,7 +1143,7 @@ export default function App() {
     }
     if (movement) {
       if (movement.kind === "marquee") {
-        setSelectedItems(marqueeItems(plan, { ...movement, current: releasePoint }, view.zoom, showDimensions));
+        setSelectedItems(marqueeItems(plan, notes, groups, { ...movement, current: releasePoint }, view.zoom, showDimensions));
       } else if (movement.kind === "dimension") {
         const offset = dimensionOffsetAt(movement, releasePoint);
         dimensionWasDragged.current = offset !== movement.initialOffset;
@@ -817,6 +1159,8 @@ export default function App() {
           if (commit(current => mergeNodes(current, final.id, targetId))) {
             setSelection(planRef.current.nodes.some(node => node.id === targetId) ? { kind: "node", id: targetId } : null);
           }
+        } else if (final.kind === "group" && (final.preview !== plan || final.previewNotes !== notesRef.current)) {
+          commitEditor(current => ({ ...current, plan: final.preview, notes: final.previewNotes }));
         } else if (final.preview !== plan) commit(() => final.preview);
       } else if (movement.kind === "pan") {
         const client = event.shiftKey ? constrainToAxis({ x: event.clientX, y: event.clientY }, movement.client)
@@ -870,18 +1214,26 @@ export default function App() {
       setMessage(null);
       return;
     }
-    const point = draftPoint(raw, event.altKey, event.shiftKey);
-    if (!point) return;
     if (tool === "wall" || tool === "room") {
+      const point = draftPoint(raw, event.altKey, event.shiftKey, false);
+      if (!point) return;
       if (!origin) { setOrigin(point); setPointer(point); return; }
       const joinsExisting = plan.nodes.some(node => distance(node, point) < 1);
       const success = commit(p => tool === "room" ? addRoom(p, origin, point, thickness) : addWall(p, origin, point, thickness));
       if (success) {
         setOrigin(tool === "room" || joinsExisting ? null : point);
+        setPointer(point);
         setSelection(null);
       }
     } else {
-      const hit = nearestWall(plan, raw, 18 / (SCALE * view.zoom));
+      let hit: ReturnType<typeof placementAt>;
+      try {
+        hit = placementAt(raw, event.altKey);
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        setEditError(error.message);
+        return;
+      }
       if (!hit) { setEditError("Click directly on a wall to place an opening or dimension."); return; }
       if (tool === "dimension") {
         setShowDimensions(true);
@@ -903,12 +1255,12 @@ export default function App() {
   };
 
   const replaceProject = (next: ReturnType<typeof makeProject>) => {
-    planRef.current = next.plan;
-    sketchRef.current = next.sketches;
-    setPlan(next.plan);
-    setSketches(next.sketches);
+    syncingProject.current = true;
+    applySnapshot({ plan: next.plan, notes: structuredClone(next.sketches), groups: next.groups ?? [] }, next.sketches);
     setPast([]);
     setFuture([]);
+    pastRef.current = [];
+    futureRef.current = [];
     setSelection(null);
     chooseTool("select");
     setSavePaused(false);
@@ -920,7 +1272,7 @@ export default function App() {
     try {
       if (file.size > 10_000_000) throw new Error("This project is too large. The limit is 10 MB.");
       const next = parseProject(await file.text());
-      if ((plan.walls.length || sketches.length) && !window.confirm("Open this project? Download the current project first if you want to keep it.")) return;
+      if ((plan.walls.length || notes.length) && !window.confirm("Open this project? Download the current project first if you want to keep it.")) return;
       replaceProject(next);
       notify("Project opened.");
     } catch (error) {
@@ -931,14 +1283,7 @@ export default function App() {
     if (!api) return;
     setExporting(true);
     try {
-      const options = {
-        elements: [...planToElements(planRef.current, showDimensions), ...sketchRef.current], files: api.getFiles(),
-        appState: { ...api.getAppState(), exportBackground: true, viewBackgroundColor: PAPER, exportWithDarkMode: false },
-        exportPadding: 50,
-      };
-      const content = format === "svg"
-        ? (await exportToSvg(options)).outerHTML
-        : await exportToBlob({ ...options, mimeType: "image/png", maxWidthOrHeight: 3200 });
+      const content = await exportDrawing(api, [...planToElements(planRef.current, showDimensions), ...notesRef.current], format);
       downloadFile(content, format === "svg" ? "image/svg+xml" : "image/png", `${plan.name}.${format}`);
       notify(`${format.toUpperCase()} exported. Use the labeled dimensions; the image is not print-to-scale.`);
     } catch (error) {
@@ -963,13 +1308,28 @@ export default function App() {
   const beginDimensionEdit = (id: string, measurement?: "thickness") => {
     chooseTool("select");
     const kind = measurement === "thickness" ? "thickness" : "wall";
-    setSelection({ kind, id });
+    setSelection({ kind: measurement === "thickness" ? "thickness" : "dimension", id });
+    if (!measurement && isWallDegenerate(plan, plan.walls.find(wall => wall.id === id)!)) {
+      setEditError("Move the wall's junctions apart before editing its length.");
+      return;
+    }
     setEditingDimension({ kind, id });
   };
   const beginAngleEdit = (angleId: string) => {
     chooseTool("select");
     setSelection({ kind: "angle", id: angleId });
+    if (!hasAngleGeometry(plan, plan.angleDimensions!.find(angle => angle.id === angleId)!)) return;
     setEditingDimension({ kind: "angle", id: angleId });
+  };
+  const measurementKeyDown = (event: ReactKeyboardEvent<SVGRectElement>, item: SelectionItem, edit: () => void) => {
+    if (!["Enter", " ", "Delete", "Backspace"].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === "Delete" || event.key === "Backspace") {
+      if (visibleSelection.length > 1 && selectedKeys.has(selectionKey(item))) removeSelected();
+      else removeItems([item]);
+    } else if (event.shiftKey) setSelectedItems(current => toggleSelection(current, item));
+    else edit();
   };
   const selectedOpening = selection && ["door", "window"].includes(selection.kind) ? displayPlan.openings.find(o => o.id === selection.id) : undefined;
   const selectedRoom = selection?.kind === "room" ? rooms.find(r => r.id === selection.id) : undefined;
@@ -985,30 +1345,61 @@ export default function App() {
   const lengthUnit = getLengthUnit(plan);
   const unitLabel = { m: "Meters", cm: "Centimeters", ft: "Feet & inches", in: "Inches" }[lengthUnit];
   const displayedSaveState = savePaused || saveState === "error" ? "error"
-    : savedSnapshot?.plan === plan && savedSnapshot.sketches === sketches ? "saved" : "saving";
+    : !pendingNotes.current && savedSnapshot?.plan === plan && savedSnapshot.notes === notes && savedSnapshot.groups === groups ? "saved" : "saving";
   const saveLabel = displayedSaveState === "saved" ? "Saved on this device"
     : displayedSaveState === "saving" ? "Saving..." : "Not saved locally";
   const showDefaults = ["wall", "room", "door", "window"].includes(tool);
   const hasSelection = visibleSelection.length > 1 || !!(selectedWall || selectedNode || selectedOpening || selectedRoom
+    || selection?.kind === "dimension" && displayPlan.walls.some(wall => wall.id === selection.id && wall.dimension)
     || selection?.kind === "thickness" && displayPlan.thicknessDimensions?.some(dimension => dimension.id === selection.id)
     || selection?.kind === "angle" && displayPlan.angleDimensions?.some(angle => angle.id === selection.id));
   const inputFeedback = geometryDrag?.error ?? drawingFeedback?.error ?? editError;
-  const editor = useMemo(() => <Excalidraw excalidrawAPI={setApi} onChange={onSceneChange}
-    initialData={{ elements: initialElements, appState: { viewBackgroundColor: PAPER, currentItemStrokeColor: palette.ink, currentItemFontFamily: 5 } }}
-    viewModeEnabled={tool !== "sketch"} zenModeEnabled={tool !== "sketch"} theme="light"
-    handleKeyboardGlobally={false} autoFocus={false} aiEnabled={false}
-    UIOptions={{ canvasActions: { clearCanvas: false, loadScene: false, saveToActiveFile: false, export: false, saveAsImage: false, toggleTheme: false, changeViewBackgroundColor: false }, tools: { image: false } }}
-    onPaste={(data) => {
-      if (data.files?.length || data.elements?.some(e => ["image", "embeddable", "iframe", "frame", "magicframe"].includes(e.type))) {
-        notify("The sketch layer supports shapes, text, and freehand strokes, not images or embedded content.", true);
-        return false;
-      }
-      return true;
-    }}>
-    <MainMenu><MainMenu.DefaultItems.Help /></MainMenu>
-  </Excalidraw>, [initialElements, onSceneChange, tool, notify]);
+  const pickedGroups = selectedGroups(groups, visibleSelection);
+  const canGroup = visibleSelection.length > 1 && !(pickedGroups.length === 1
+    && pickedGroups[0].members.length === visibleSelection.length);
+  const showTextProperties = tool === "text" || tool === "select" && visibleSelection.length === 1 && visibleSelection[0].kind === "note";
+  const onNativePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || !(event.target instanceof Element) || !event.target.closest("canvas")) return;
+    nativeSelectionBase.current = event.shiftKey ? planMembers(selectionRef.current) : [];
+    const current = apiRef.current;
+    if (!current || current.getAppState().activeTool.type !== "selection" || !stage.current) return;
+    const start = toWorld(event);
+    const note = [...notesRef.current].reverse().find(note => {
+      const bounds = noteBounds([note])!;
+      return start.x >= bounds.x && start.y >= bounds.y && start.x <= bounds.x + bounds.width && start.y <= bounds.y + bounds.height;
+    });
+    if (!note) return;
+    const item: SelectionItem = { kind: "note", id: note.id };
+    if (event.ctrlKey || event.metaKey) enteredMember.current = selectionKey(item);
+    nativeIndividual.current = enteredMember.current === selectionKey(item);
+    if (nativeIndividual.current) return;
+    const members = expandGroups(groupsRef.current, [item]);
+    const initial = selectionRef.current;
+    const mixed = initial.some(item => item.kind !== "note");
+    const included = members.every(member => initial.some(item => selectionKey(item) === selectionKey(member)));
+    if (members.length === 1 && !(mixed && (included || event.shiftKey))) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const items = event.shiftKey ? addSelections(initial, members) : included ? initial : members;
+    chooseTool("select");
+    const base = planRef.current, baseNotes = notesRef.current;
+    setDrag({ kind: "group", items, start, current: start, base, preview: base, baseNotes, previewNotes: baseNotes,
+      error: null, delta: { x: 0, y: 0 },
+      press: event.shiftKey ? { item, initial, items, toggle: members, started: false } : undefined });
+    clearNoteSelection();
+    if (!event.shiftKey) setSelectedItems(items);
+    stage.current.setPointerCapture(event.pointerId);
+  }, [chooseTool, clearNoteSelection, setDrag, setSelectedItems, toWorld]);
+  // Holes let the real canvas receive text and resize-handle gestures without synthetic events.
+  const textClip = useMemo(() => tool === "select" && api ? textInteractionClip(notes, {
+    ...api.getAppState(), selectedElementIds: Object.fromEntries(nativeNoteSelection(groups, selectedItems).map(id => [id, true])),
+  }) : undefined, [api, tool, notes, selectedItems, groups, view]);
+  const editor = useMemo(() => <DrawingCanvas onReady={setApi} onChange={onSceneChange}
+    initialElements={initialElements} onUnsupported={unsupportedNotes} onPointerDown={onNativePointerDown}
+    onKeyDown={onKeyDown} />,
+  [initialElements, onSceneChange, unsupportedNotes, onKeyDown, onNativePointerDown]);
 
-  return <div className={`app ${tool === "sketch" ? "is-sketch" : ""}`}>
+  return <div className="app">
     <header className="app-header">
       <div className="project-controls">
         <EditorPopover label="Project menu" trigger={<Menu size={18} />} className="project-menu">
@@ -1018,7 +1409,6 @@ export default function App() {
           <button data-close-popover onClick={() => setPendingNew(true)}><Plus size={16} /> New plan</button>
           <div className="sidebar-divider" />
           <button data-close-popover onClick={() => setShowHelp(true)}><CircleHelp size={16} /> Quick guide & shortcuts</button>
-          <a href="https://excalidraw.com" target="_blank" rel="noreferrer" className="powered-by">Built with Excalidraw</a>
           <small>Saved locally in this browser.</small>
         </EditorPopover>
         <div className="project-heading">
@@ -1065,7 +1455,7 @@ export default function App() {
           <p className="helper">Lengths and unitless input use this unit. Room areas stay in {plan.units === "metric" ? "square meters" : "square feet"}.</p>
           <button className={`option-row ${snap ? "enabled" : ""}`} aria-pressed={snap} onClick={() => setSnap(!snap)}><Magnet size={16} /> Snap to geometry <span className="switch" /></button>
           <button className={`option-row ${orthogonal ? "enabled" : ""}`} aria-pressed={orthogonal} onClick={() => setOrthogonal(!orthogonal)}><Scan size={16} /> Straight walls <span className="switch" /></button>
-          <p className="helper">Hold Shift to lock drawing or movement horizontally or vertically. Alt bypasses grid and geometry snapping, not the Shift lock.</p>
+          <p className="helper">Dashed guides show alignment with existing geometry. Hold Shift to lock an axis; Alt hides guides and bypasses snapping without disabling the Shift lock.</p>
           <div className="sidebar-divider" />
           <button className={`option-row ${showDimensions ? "enabled" : ""}`} onClick={() => { setShowDimensions(!showDimensions); setEditingDimension(null); }} aria-pressed={showDimensions}><Ruler size={15} /> Dimensions <span className="switch" /></button>
           <button className={`option-row ${showGrid ? "enabled" : ""}`} onClick={() => setShowGrid(!showGrid)} aria-pressed={showGrid}><Grid2X2 size={15} /> Dot grid <span className="switch" /></button>
@@ -1084,7 +1474,9 @@ export default function App() {
       }} />
     </header>
 
-    <nav className="tool-toolbar" aria-label="Drawing tools">
+    {tool === "notes" ? <NotesControls api={api} onDone={() => chooseTool("select")}
+      onDelete={removeSelected} onGroup={changeGrouping} canGroup={canGroup}
+      canUngroup={pickedGroups.length > 0} error={inputFeedback} /> : <nav className="tool-toolbar" aria-label="Drawing tools">
       <button className={`tool-button ${tool === "hand" ? "active" : ""}`} aria-label="Pan tool" aria-pressed={tool === "hand"} title="Pan (H)"
         onClick={() => chooseTool(tool === "hand" ? "select" : "hand")}><Hand size={19} /><kbd>H</kbd></button>
       <span className="toolbar-divider" />
@@ -1095,31 +1487,52 @@ export default function App() {
         </button>,
       )}
       <span className="toolbar-divider" />
-      <button className={`tool-button ${tool === "sketch" ? "active" : ""}`} onClick={() => chooseTool("sketch")}
-        aria-label="Sketch & annotate" title="Sketch & annotate (S)" aria-pressed={tool === "sketch"}><Pencil size={19} /><kbd>S</kbd></button>
-    </nav>
+      <button className={`tool-button ${tool === "text" ? "active" : ""}`} onClick={() => chooseTool("text")}
+        aria-label="Text tool" aria-pressed={tool === "text"} title="Text (T)"><Type size={19} /><kbd>T</kbd></button>
+      <button className="tool-button" onClick={() => chooseTool("notes")}
+        aria-label="Renovation notes" title="Renovation notes (S)"><Pencil size={19} /><kbd>S</kbd></button>
+    </nav>}
+    {showTextProperties && <NotesControls api={api} onDelete={removeSelected} error={inputFeedback} />}
 
-    <div className="workspace">
       <main className="drawing-area">
-        <div className={`canvas-stage ${tool === "sketch" ? "sketch-mode" : "draft-mode"}`} ref={stage}>
+        <div className="canvas-stage" ref={stage}
+          onPointerMoveCapture={event => { if (event.target === stage.current) onPointerMove(event); }}
+          onPointerUpCapture={event => { if (event.target === stage.current) onPointerUp(event); }}
+          onPointerCancel={event => { if (event.target === stage.current) setDrag(null); }}
+          onLostPointerCapture={event => { if (event.target === stage.current) setDrag(null); }}
+          onWheelCapture={event => {
+            if (tool === "notes" || !(event.target instanceof Element)
+              || !event.target.closest("canvas, .interaction-layer")) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const rect = stage.current!.getBoundingClientRect();
+            zoom(Math.exp(-event.deltaY * 0.0015), { x: event.clientX - rect.left, y: event.clientY - rect.top });
+          }}>
           {editor}
-          {showGrid && tool !== "sketch" && <div className="grid-layer" style={{
+          {showGrid && tool !== "notes" && <div className="grid-layer" style={{
             backgroundSize: `${50 * SCALE * view.zoom}px ${50 * SCALE * view.zoom}px`,
             backgroundPosition: `${view.scrollX * view.zoom}px ${view.scrollY * view.zoom}px`,
             opacity: view.zoom < 0.5 ? 0.22 : 0.45,
           }} />}
-          {tool !== "sketch" && <svg className={`interaction-layer tool-${tool}`} aria-label="Floor plan canvas" data-testid="draft-canvas" tabIndex={-1}
+          {tool !== "notes" && <svg className={`interaction-layer tool-${tool}`} aria-label="Floor plan canvas" data-testid="draft-canvas" tabIndex={-1}
+            style={textClip === undefined ? undefined : { clipPath: "url(#text-interaction-clip)" }}
             onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}
             onDoubleClick={onWallDoubleClick}
             onPointerCancel={() => { setDrag(null); setOrigin(null); setAngleDraft(null); }}
             onLostPointerCapture={() => setDrag(null)}
-            onPointerLeave={() => { if (!dragRef.current && !origin && !angleDraft) { previewFrame.cancel(); setPointer(null); } }}
-            onContextMenu={event => { event.preventDefault(); previewFrame.cancel(); setOrigin(null); setAngleDraft(null); }}
-            onWheel={event => {
-              event.preventDefault();
-              const rect = stage.current!.getBoundingClientRect();
-              zoom(Math.exp(-event.deltaY * 0.0015), { x: event.clientX - rect.left, y: event.clientY - rect.top });
+            onPointerLeave={() => {
+              if (!dragRef.current) {
+                previewFrame.cancel(); clearGuides(); lastPointer.current = null;
+                if (!origin && !angleDraft) setPointer(null);
+              }
+            }}
+            onContextMenu={event => {
+              event.preventDefault(); previewFrame.cancel(); clearGuides(); lastPointer.current = null;
+              setOrigin(null); setAngleDraft(null);
             }}>
+            {textClip !== undefined && <defs><clipPath id="text-interaction-clip" clipPathUnits="userSpaceOnUse">
+              <path d={textClip} clipRule="evenodd" />
+            </clipPath></defs>}
             <g transform={`translate(${view.scrollX * view.zoom}, ${view.scrollY * view.zoom}) scale(${SCALE * view.zoom})`}>
               {selectedRoom && <polygon points={selectedRoom.points.map(p => `${p.x},${p.y}`).join(" ")} className="selected-room" />}
               {displayPlan.walls.filter(wall => selectedNodeIds.has(wall.a) || selectedNodeIds.has(wall.b)).map(wall => {
@@ -1173,6 +1586,32 @@ export default function App() {
                   height={Math.abs(origin.y - pointer.y)} className={`preview-room ${drawingInvalid ? "invalid-preview" : ""}`} strokeWidth={thickness} />
                 : <line x1={origin.x} y1={origin.y} x2={pointer.x} y2={pointer.y}
                   className={`preview-line ${drawingInvalid ? "invalid-preview" : ""}`} strokeWidth={thickness} />)}
+              {placement && !drag && (tool === "door" || tool === "window") && (() => {
+                const points = openingPoints(plan, placement);
+                if (!points) return null;
+                const [a, b] = points;
+                const wall = plan.walls.find(wall => wall.id === placement.wallId)!;
+                const normal = { x: -(b.y - a.y) / placement.width, y: (b.x - a.x) / placement.width };
+                const leaf = { x: a.x + normal.x * placement.width, y: a.y + normal.y * placement.width };
+                const outside = placement.offset - placement.width / 2 < 0
+                  || placement.offset + placement.width / 2 > distance(...wallPoints(plan, wall))
+                  || plan.openings.some(opening => opening.wallId === wall.id
+                    && Math.abs(opening.offset - placement.offset) < (opening.width + placement.width) / 2);
+                return <g className={`opening-placement ${outside ? "invalid-placement" : ""}`} data-testid="opening-placement" aria-hidden="true">
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} className="opening-placement-body" strokeWidth={wall.thickness} />
+                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
+                  {placement.kind === "door" && <>
+                    <line x1={a.x} y1={a.y} x2={leaf.x} y2={leaf.y} />
+                    <path d={`M ${b.x} ${b.y} A ${placement.width} ${placement.width} 0 0 1 ${leaf.x} ${leaf.y}`} />
+                  </>}
+                  {placement.kind === "window" && <path d={[
+                    `M ${a.x + normal.x * wall.thickness / 2} ${a.y + normal.y * wall.thickness / 2}`,
+                    `L ${b.x + normal.x * wall.thickness / 2} ${b.y + normal.y * wall.thickness / 2}`,
+                    `L ${b.x - normal.x * wall.thickness / 2} ${b.y - normal.y * wall.thickness / 2}`,
+                    `L ${a.x - normal.x * wall.thickness / 2} ${a.y - normal.y * wall.thickness / 2} Z`,
+                  ].join(" ")} />}
+                </g>;
+              })()}
               {highlights.length > 0 && <g className="geometry-warning-overlay" data-testid="geometry-warning-overlay"
                 role="img" aria-label={feedbackIssues.map(issue => issue.message).join(" ")}>
                 {highlights.map(highlight => "point" in highlight
@@ -1187,36 +1626,34 @@ export default function App() {
                 <path d={`M ${pointer.x - 100 / view.zoom} ${pointer.y} h ${200 / view.zoom} M ${pointer.x} ${pointer.y - 100 / view.zoom} v ${200 / view.zoom}`} />
               </g>}
               {(tool === "select" || tool === "dimension") && dimensionLabels.map(label => {
-                const wallId = label.id.slice("plan-dim-label-".length);
+                const wallId = label.id.startsWith("plan-warning-length-")
+                  ? label.id.slice("plan-warning-length-".length) : label.id.slice("plan-dim-label-".length);
                 const padding = 5 / (SCALE * view.zoom);
                 const wall = displayPlan.walls.find(w => w.id === wallId)!;
-                const dim = dimensionPosition(displayPlan, dimensionPreview?.measurement !== "thickness" && dimensionPreview?.id === wallId
-                  ? { ...wall, dimensionOffset: dimensionPreview.offset } : wall);
-                const cursor = Math.abs(dim.axis.x) < 0.15 ? "ns-resize" : Math.abs(dim.axis.y) < 0.15 ? "ew-resize"
+                const dim = isWallDegenerate(displayPlan, wall) ? null
+                  : dimensionPosition(displayPlan, dimensionPreview?.measurement !== "thickness" && dimensionPreview?.id === wallId
+                    ? { ...wall, dimensionOffset: dimensionPreview.offset } : wall);
+                const cursor = !dim ? "pointer" : Math.abs(dim.axis.x) < 0.15 ? "ns-resize" : Math.abs(dim.axis.y) < 0.15 ? "ew-resize"
                   : dim.axis.x * dim.axis.y > 0 ? "nwse-resize" : "nesw-resize";
-                return <g key={wallId} style={{ cursor }} className={drag?.kind === "dimension" && drag.id === wallId ? "dimension-dragging" : ""}>
-                  <line data-testid={`dimension-line-${wallId}`} className="dimension-line-target"
+                return <g key={wallId} style={{ cursor }} className={`dimension-control ${selectedKeys.has(`dimension:${wallId}`) ? "selected" : ""} ${drag?.kind === "dimension" && drag.id === wallId ? "dimension-dragging" : ""}`}>
+                  {dim && <line data-testid={`dimension-line-${wallId}`} className="dimension-line-target"
                     x1={dim.a.x} y1={dim.a.y} x2={dim.b.x} y2={dim.b.y}
                     onPointerDown={event => startDimensionDrag(event, wallId)}>
                     <title>Drag to move this measurement inward or outward</title>
-                  </line>
-                  <rect data-testid={`dimension-${wallId}`} className="dimension-hit-target"
+                  </line>}
+                  <rect data-testid={`${dim ? "dimension" : "dimension-warning"}-${wallId}`} className="dimension-hit-target"
                   x={label.x / SCALE - padding} y={label.y / SCALE - padding}
                   width={label.width / SCALE + padding * 2} height={label.height / SCALE + padding * 2}
                   role="button" tabIndex={0} aria-label={`Edit measurement ${label.text}`}
+                  aria-pressed={selectedKeys.has(`dimension:${wallId}`)}
                   onPointerDown={event => startDimensionDrag(event, wallId)}
                   onDoubleClick={event => {
                     event.stopPropagation();
                     if (!event.shiftKey && !dimensionWasDragged.current) beginDimensionEdit(wallId);
                   }}
-                  onKeyDown={event => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault(); event.stopPropagation();
-                      if (event.shiftKey) setSelectedItems(current => toggleSelection(current, { kind: "wall", id: wallId }));
-                      else beginDimensionEdit(wallId);
-                    }
-                  }}>
-                  <title>Drag inward or outward to reposition. Double-click to edit the value.</title>
+                  onKeyDown={event => measurementKeyDown(event, { kind: "dimension", id: wallId }, () => beginDimensionEdit(wallId))}>
+                  <title>{dim ? "Drag to reposition. Double-click to edit. Delete removes only this measurement."
+                    : "Select and press Delete to remove this measurement."}</title>
                 </rect></g>;
               })}
               {(tool === "select" || tool === "dimension") && thicknessLabels.map(label => {
@@ -1237,52 +1674,44 @@ export default function App() {
                     x={label.x / SCALE - padding} y={label.y / SCALE - padding}
                     width={label.width / SCALE + padding * 2} height={label.height / SCALE + padding * 2}
                     role="button" tabIndex={0} aria-label={`Thickness measurement ${formatLength(wall.thickness, displayPlan)}`}
+                    aria-pressed={selectedKeys.has(`thickness:${id}`)}
                     onPointerDown={event => startDimensionDrag(event, id, "thickness")}
                     onDoubleClick={event => {
                       event.stopPropagation();
                       if (!event.shiftKey && !dimensionWasDragged.current) beginDimensionEdit(id, "thickness");
                     }}
-                    onKeyDown={event => {
-                      if (event.key === "Enter" || event.key === " ") {
-                        event.preventDefault(); event.stopPropagation();
-                        if (event.shiftKey) setSelectedItems(current => toggleSelection(current, { kind: "thickness", id }));
-                        else beginDimensionEdit(id, "thickness");
-                      }
-                    }}>
-                    <title>Drag along the wall to reposition. Double-click to edit wall thickness.</title>
+                    onKeyDown={event => measurementKeyDown(event, { kind: "thickness", id }, () => beginDimensionEdit(id, "thickness"))}>
+                    <title>Drag along the wall to reposition. Double-click to edit wall thickness. Delete removes only this measurement.</title>
                   </rect>
                 </g>;
               })}
               {angleLabels.map(label => {
-                const angleId = label.id.slice("plan-angle-label-".length);
+                const angleId = label.id.startsWith("plan-warning-angle-label-")
+                  ? label.id.slice("plan-warning-angle-label-".length) : label.id.slice("plan-angle-label-".length);
                 const dimension = renderPlan.angleDimensions!.find(angle => angle.id === angleId)!;
-                const angle = anglePosition(renderPlan, dimension);
+                const angle = hasAngleGeometry(renderPlan, dimension) ? anglePosition(renderPlan, dimension) : null;
                 const padding = 5 / (SCALE * view.zoom);
                 const interactive = tool === "select" && angleId !== ANGLE_PREVIEW_ID;
                 return <g key={angleId} className={`angle-control ${selectedKeys.has(`angle:${angleId}`) ? "selected" : ""}`}
                   style={{ pointerEvents: interactive ? undefined : "none" }}>
-                  <polyline data-testid={`angle-arc-${angleId}`} className="angle-arc-target"
+                  {angle && <polyline data-testid={`angle-arc-${angleId}`} className="angle-arc-target"
                     points={angle.arc.map(point => `${point.x},${point.y}`).join(" ")}
                     style={{ pointerEvents: interactive ? "stroke" : "none" }}
-                    onPointerDown={interactive ? event => startAngleDrag(event, angleId) : undefined} />
-                  <rect data-testid={`angle-${angleId}`} className="dimension-hit-target"
+                    onPointerDown={interactive ? event => startAngleDrag(event, angleId) : undefined} />}
+                  <rect data-testid={`${angle ? "angle" : "angle-warning"}-${angleId}`} className="dimension-hit-target"
                     x={label.x / SCALE - padding} y={label.y / SCALE - padding}
                     width={label.width / SCALE + padding * 2} height={label.height / SCALE + padding * 2}
                     role={interactive ? "button" : undefined} tabIndex={interactive ? 0 : undefined}
                     aria-label={`Angle measurement ${label.text}`}
+                    aria-pressed={interactive ? selectedKeys.has(`angle:${angleId}`) : undefined}
                     onPointerDown={interactive ? event => startAngleDrag(event, angleId) : undefined}
                     onDoubleClick={interactive ? event => {
                       event.stopPropagation();
                       if (!event.shiftKey && !angleWasDragged.current) beginAngleEdit(angleId);
                     } : undefined}
-                    onKeyDown={event => {
-                      if (interactive && (event.key === "Enter" || event.key === " ")) {
-                        event.preventDefault(); event.stopPropagation();
-                        if (event.shiftKey) setSelectedItems(current => toggleSelection(current, { kind: "angle", id: angleId }));
-                        else beginAngleEdit(angleId);
-                      }
-                    }}>
-                    <title>Drag inward or outward to reposition. Double-click to edit the angle.</title>
+                    onKeyDown={interactive ? event => measurementKeyDown(event, { kind: "angle", id: angleId }, () => beginAngleEdit(angleId)) : undefined}>
+                    <title>{angle ? "Drag to reposition. Double-click to edit the angle. Delete removes only this measurement."
+                      : "Select and press Delete to remove this measurement."}</title>
                   </rect>
                 </g>;
               })}
@@ -1301,7 +1730,7 @@ export default function App() {
                         else setSelection({ kind: "node", id: node.id });
                       } else if (!event.ctrlKey && !event.metaKey && !event.altKey && ["Delete", "Backspace"].includes(event.key)) {
                         event.preventDefault(); event.stopPropagation();
-                        if (visibleSelection.length > 1 && selected) removeSelected(); else removeNode(node.id);
+                        if (visibleSelection.length > 1 && selected) removeSelected(); else removeItems([{ kind: "node", id: node.id }]);
                       }
                     }}>
                     <title>Click to select; Delete removes this node. Drag onto another node to combine. Shift locks an axis; Alt bypasses snapping and combining.</title>
@@ -1315,6 +1744,14 @@ export default function App() {
                 && <rect data-testid="selection-marquee" className="selection-marquee"
                   x={Math.min(drag.start.x, drag.current.x)} y={Math.min(drag.start.y, drag.current.y)}
                   width={Math.abs(drag.current.x - drag.start.x)} height={Math.abs(drag.current.y - drag.start.y)} />}
+              {activeGuides.length > 0 && <g className="snap-guides" data-testid="snap-guides" aria-hidden="true">
+                {activeGuides.map(guide => <g key={guide.id} data-guide-kind={guide.kind}>
+                  <line data-testid="snap-guide-line" x1={guide.a.x} y1={guide.a.y} x2={guide.b.x} y2={guide.b.y} />
+                  <circle className="snap-guide-source" cx={guide.a.x} cy={guide.a.y} r={2.5 / (SCALE * view.zoom)} />
+                  {guide.target && <circle className="snap-guide-target" data-testid="snap-guide-target"
+                    cx={guide.target.x} cy={guide.target.y} r={5 / (SCALE * view.zoom)} />}
+                </g>)}
+              </g>}
             </g>
           </svg>}
           {(editingWall || editingAngle) && editingLabel && tool === "select" && <InlineDimensionEditor key={`${editingDimension!.kind}:${editingDimension!.id}`}
@@ -1339,31 +1776,31 @@ export default function App() {
               ? `${formatLength(Math.abs(pointer.x - origin.x), plan)} × ${formatLength(Math.abs(pointer.y - origin.y), plan)}`
               : formatLength(distance(origin, pointer), plan)}
           </div>}
-          {plan.walls.length === 0 && tool === "select" && <div className="canvas-welcome">
+          {plan.walls.length === 0 && notes.length === 0 && tool === "select" && <div className="canvas-welcome">
             <h1>Start your floor plan</h1>
             <p>Draw a room, or connect walls with the Wall tool.</p>
             <button className="primary-button" onClick={() => chooseTool("room")}><Plus size={16} /> Draw your first room</button>
             <button className="text-button" onClick={() => replaceProject(makeProject(createDemoPlan(), []))}>Explore an example instead</button>
           </div>}
-          {tool === "sketch" && <button className="exit-sketch primary-button" onClick={() => chooseTool("select")}><Check size={16} /> Done sketching</button>}
-          {tool !== "sketch" && <div className="canvas-controls">
-            <div className="control-group"><button aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!past.length} onClick={undo}><Undo2 size={17} /></button>
-              <button aria-label="Redo" title="Redo (Ctrl+Shift+Z)" disabled={!future.length} onClick={redo}><Redo2 size={17} /></button></div>
+          <div className="canvas-controls">
+            <div className="control-group"><button aria-label="Undo" title="Undo (Ctrl+Z)" disabled={!past.length} onClick={() => runHistory(false)}><Undo2 size={17} /></button>
+              <button aria-label="Redo" title="Redo (Ctrl+Shift+Z)" disabled={!future.length} onClick={() => runHistory(true)}><Redo2 size={17} /></button></div>
             <div className="control-group zoom-controls"><button aria-label="Zoom out" onClick={() => zoom(1 / 1.2)}><Minus size={16} /></button>
               <span>{Math.round(view.zoom * 100)}%</span><button aria-label="Zoom in" onClick={() => zoom(1.2)}><Plus size={16} /></button>
               <button aria-label="Fit plan" title="Fit plan to view" onClick={fit}><Maximize size={15} /></button></div>
-          </div>}
+          </div>
           {message && <div className={`toast ${message.error ? "error" : ""}`} role={message.error ? "alert" : "status"}>
             <span>{message.text}</span><button aria-label="Dismiss message" onClick={() => setMessage(null)}><X size={15} /></button>
           </div>}
         </div>
         <footer className="status-bar"><span className="tool-hint">{toolHint}</span>
-          <span className="status-units">{unitLabel}<span className="status-separator">|</span>{snap ? `${formatLength(50, plan)} snap` : "Free placement"}</span>
+          <span className="status-units">{tool === "notes" ? "Renovation notes - not measured geometry"
+            : <>{unitLabel}<span className="status-separator">|</span>{snap ? `${formatLength(50, plan)} snap` : "Free placement"}</>}</span>
           <button className="icon-button help-button" title="Quick guide" aria-label="Quick guide" onClick={() => setShowHelp(true)}><CircleHelp size={18} /></button>
         </footer>
       </main>
 
-      {(showDefaults || tool === "dimension" || hasSelection || feedbackIssues.length > 0 || inputFeedback) && <aside className="floating-inspector" aria-label="Properties">
+      {tool !== "notes" && !showTextProperties && (showDefaults || tool === "dimension" || hasSelection || feedbackIssues.length > 0 || inputFeedback) && <aside className="floating-inspector" aria-label="Properties">
         {tool === "dimension" && <div className="dimension-modes" role="group" aria-label="Measurement type">
           <button className={`option-row ${measurementType === "length" ? "enabled" : ""}`} aria-pressed={measurementType === "length"}
             onClick={() => { setDrag(null); setMeasurementType("length"); }}><Ruler size={16} /> Length</button>
@@ -1380,10 +1817,11 @@ export default function App() {
             }} />}
         </> : visibleSelection.length > 1 ? <>
           <div className="section-heading"><span data-testid="selection-count" role="status">{visibleSelection.length} items selected</span></div>
-          <p className="helper">Drag to move together; hold Shift to lock an axis. Shift-click adds or removes items. Delete removes the selection; Escape clears it.</p>
-          <button className="danger-button" onClick={removeSelected}><Trash2 size={15} /> Delete selected</button>
+          <p className="helper">Drag to move together; hold Shift to lock an axis. Shift-click adds or removes items. Ctrl/Cmd-click selects a group member. Delete removes the selection; Escape clears it.</p>
+          <GroupActions canGroup={canGroup} canUngroup={pickedGroups.length > 0} onChange={changeGrouping} />
+          <DeleteButton onDelete={removeSelected}>Delete selected</DeleteButton>
         </> : <Properties plan={propertyPlan} selection={selection} commit={commit}
-          clear={() => { setDrag(null); setSelection(null); }} onDeleteNode={removeNode} onAddThickness={addThickness} />}
+          onDelete={removeSelected} onAddThickness={addThickness} />}
         {feedbackIssues.length > 0 && <div className="geometry-feedback" data-testid="geometry-feedback" role="status" aria-live="polite">
           <strong>Geometry needs attention</strong>
           <p>Red geometry can still be edited and saved.</p>
@@ -1394,7 +1832,6 @@ export default function App() {
         </div>}
         {inputFeedback && <p className="geometry-feedback" data-testid="input-feedback" role="alert">{inputFeedback}</p>}
       </aside>}
-    </div>
     {pendingNew && <div className="modal-backdrop" onClick={() => setPendingNew(false)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="new-title" onClick={event => event.stopPropagation()}>
       <button className="modal-close icon-button" aria-label="Close dialog" onClick={() => setPendingNew(false)}><X size={18} /></button>
       <h2 id="new-title">New plan</h2>
@@ -1407,10 +1844,10 @@ export default function App() {
       <button className="modal-close icon-button" aria-label="Close guide" onClick={() => setShowHelp(false)}><X size={18} /></button>
       <h2 id="help-title">Quick guide</h2>
       <div className="guide-step"><span>1</span><div><strong>Draw the space</strong><p>Use Room (R) for a rectangle or Wall (W) for connected walls. Click to start and click to finish. Esc ends a wall chain. In Select mode, drag empty canvas to select enclosed items. Shift-click toggles items; Shift-drag adds to the selection. Drag selected items to move them together, or press Delete to remove them.</p></div></div>
-      <div className="guide-step"><span>2</span><div><strong>Make it measured</strong><p>Double-click a measurement to edit it right on the plan, or select a wall to use the inspector. Enter 4.2 m, 420 cm, or 12' 6". Basic math works too: 20' - 10', (4 m + 20 cm) / 2, or 180 deg - 90 deg. Enter applies; Esc cancels. Length edits keep A fixed and move B; thickness edits keep the centerline fixed. Double-click a wall in Select mode to split it with a new node, or use Add midpoint node in its properties. Drag a circular junction handle to reshape connected walls live. Drop it on another node to combine them. Hold Shift before or during drawing, moving nodes, walls, groups, or panning to lock horizontally or vertically. Alt bypasses grid snapping and combining without disabling the Shift lock.</p></div></div>
-      <div className="guide-step"><span>3</span><div><strong>Open up the possibilities</strong><p>Click a wall with Door (D) or Window (N). Use Dimension (M) to choose Length or Thickness, then click a wall. Drag length labels perpendicular to the wall, or thickness labels along it, to make space. Add ideas with Sketch (S).</p></div></div>
+      <div className="guide-step"><span>2</span><div><strong>Make it measured</strong><p>Double-click a measurement to edit it right on the plan, or select a wall to use the inspector. Click a measurement label and press Delete/Backspace to remove just that measurement, keeping the wall. Enter 4.2 m, 420 cm, or 12' 6". Basic math works too: 20' - 10', (4 m + 20 cm) / 2, or 180 deg - 90 deg. Enter applies; Esc cancels. Length edits keep A fixed and move B; thickness edits keep the centerline fixed. Double-click a wall in Select mode to split it with a new node, or use Add midpoint node in its properties. Drag a circular junction handle to reshape connected walls live. Drop it on another node to combine them. Hold Shift before or during drawing, moving nodes, walls, groups, or panning to lock horizontally or vertically. Alt bypasses grid snapping and combining without disabling the Shift lock.</p></div></div>
+      <div className="guide-step"><span>3</span><div><strong>Open up the possibilities</strong><p>Click a wall with Door (D) or Window (N). Use Dimension (M) to choose Length or Thickness, then click a wall. Drag length labels perpendicular to the wall, or thickness labels along it, to make space. Use Text (T) to place a text box anywhere, or Renovation notes (S) for drawing marks and arrows. Done notes returns to the measured plan.</p></div></div>
       <div className="guide-step"><span>4</span><div><strong>Check the corners</strong><p>Use Angle (A): click two walls sharing a junction, then click to place the arc. Choose the inside or outside angle with the pointer. In Select mode, drag the arc or label to adjust its radius. Double-click the label to edit degrees: the first wall stays fixed and the second rotates, keeping its length. Enter applies; Esc cancels.</p></div></div>
-      <p className="helper">Wheel to zoom · H to pan · Ctrl/Cmd+Z to undo · Ctrl/Cmd+S to download. Sketch mode has Excalidraw's own undo history. Sketches do not follow wall edits.</p>
+      <p className="helper">Ctrl/Cmd+G groups selected items; Ctrl/Cmd+Shift+G ungroups them. Ctrl/Cmd-click edits a group member. Wheel to zoom · H to pan · Ctrl/Cmd+Z to undo · Ctrl/Cmd+S to download. Geometry, notes, and groups share project history.</p>
       <div className="guide-note">A planning aid, not a construction drawing. Verify clearances and site measurements, and consult a qualified professional before structural work.</div>
       <button className="primary-button full" autoFocus onClick={() => setShowHelp(false)}>Got it</button>
     </section></div>}

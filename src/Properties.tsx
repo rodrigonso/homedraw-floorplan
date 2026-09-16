@@ -1,14 +1,16 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftRight, CirclePlus, Ruler, Trash2 } from "lucide-react";
+import { ArrowLeftRight, CirclePlus, Ruler } from "lucide-react";
 import {
-  deleteAngleDimension, deleteOpening, deleteThicknessDimension, deleteWall, detectRooms, distance, formatArea, formatLength, formatLengthInput, getNodeDeletionInfo, isWallDegenerate,
-  parseAngle, parseLength, parsePosition, renameRoom, resizeAngle, resizeWall, setWallThickness, splitWall, toggleDimension, updateAngleDimension, updateOpening, updateThicknessDimension, wallPoints,
+  detectRooms, distance, formatArea, formatLength, formatLengthInput, getNodeDeletionInfo, isWallDegenerate,
+  parseAngle, parseLength, parsePosition, renameRoom, resizeAngle, resizeWall, setDimensionOffset, setWallThickness, splitWall, toggleDimension, updateAngleDimension, updateOpening, updateThicknessDimension, wallPoints,
   type MeasurementSettings, type Plan,
 } from "./model";
 import type { Selection } from "./scene";
 import { anglePosition, formatAngle, formatAngleInput, hasAngleGeometry } from "./angles";
+import { dimensionPosition } from "./dimensions";
+import { DeleteButton } from "./SelectionActions";
 
-export type Commit = (change: (plan: Plan) => Plan) => boolean;
+type Commit = (change: (plan: Plan) => Plan) => boolean;
 
 export function LengthField({ label, value, units, onApply, disabled = false, position = false }: {
   label: string; value: number; units: MeasurementSettings; onApply: (value: number) => boolean | void;
@@ -65,8 +67,8 @@ function MeasurementField({ label, value, formatted, resetText = formatted, pars
   </label>;
 }
 
-export default function Properties({ plan, selection, commit, clear, onDeleteNode, onAddThickness }: {
-  plan: Plan; selection: Selection; commit: Commit; clear: () => void; onDeleteNode: (id: string) => void;
+export default function Properties({ plan, selection, commit, onDelete, onAddThickness }: {
+  plan: Plan; selection: Selection; commit: Commit; onDelete: () => void;
   onAddThickness: (wallId: string) => void;
 }) {
   const node = selection?.kind === "node" ? plan.nodes.find(node => node.id === selection.id) : undefined;
@@ -76,6 +78,20 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
   const room = selection?.kind === "room" ? detectRooms(plan).find(r => r.id === selection.id) : undefined;
   const angle = selection?.kind === "angle" ? plan.angleDimensions?.find(a => a.id === selection.id) : undefined;
   const thickness = selection?.kind === "thickness" ? plan.thicknessDimensions?.find(dimension => dimension.id === selection.id) : undefined;
+  const length = selection?.kind === "dimension" ? plan.walls.find(wall => wall.id === selection.id && wall.dimension) : undefined;
+  if (length) {
+    const collapsed = isWallDegenerate(plan, length);
+    return <>
+      <div className="section-heading"><span>Length measurement</span></div>
+      <LengthField label="Wall length" value={distance(...wallPoints(plan, length))} units={plan} disabled={collapsed}
+        onApply={value => commit(p => resizeWall(p, length.id, value))} />
+      {!collapsed && <LengthField label="Measurement offset" value={dimensionPosition(plan, length).offset} units={plan} position
+        onApply={offset => commit(p => setDimensionOffset(p, length.id, offset))} />}
+      <p className="helper">Drag the label to reposition it; double-click to edit the wall length. Delete removes only the measurement, not the wall or its openings.</p>
+      {collapsed && <p className="helper geometry-feedback">Move the junctions apart to restore this measurement's direction.</p>}
+      <DeleteButton onDelete={onDelete}>Delete measurement</DeleteButton>
+    </>;
+  }
   if (thickness) {
     const host = plan.walls.find(wall => wall.id === thickness.wallId)!;
     const collapsed = isWallDegenerate(plan, host);
@@ -87,9 +103,7 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
         onApply={offset => commit(p => updateThicknessDimension(p, thickness.id, { offset }))} />
       <p className="helper">Measures the two wall faces. Thickness changes equally on either side of the centerline. Drag the label along the wall to reposition it; negative offsets place it before endpoint B.</p>
       {collapsed && <p className="helper geometry-feedback">Move the junctions apart to restore this measurement's direction.</p>}
-      <button className="danger-button" onClick={() => {
-        if (commit(p => deleteThicknessDimension(p, thickness.id))) clear();
-      }}><Trash2 size={15} /> Delete thickness measurement</button>
+      <DeleteButton onDelete={onDelete}>Delete thickness measurement</DeleteButton>
     </>;
   }
   if (node) {
@@ -103,15 +117,13 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
       {info.removedAngles > 0 && <p className="helper">{info.removedAngles} attached angle {info.removedAngles === 1 ? "measurement will" : "measurements will"} be removed.</p>}
       {info.removedThickness > 0 && <p className="helper">{info.removedThickness} thickness {info.removedThickness === 1 ? "measurement will" : "measurements will"} be removed.</p>}
       {info.changesStyle && <p className="helper">The joined wall keeps the first wall's thickness and dimension position.</p>}
-      <button className="danger-button" onClick={() => onDeleteNode(node.id)}><Trash2 size={15} /> Delete node</button>
+      <DeleteButton onDelete={onDelete}>Delete node</DeleteButton>
     </>;
   }
   if (angle && !hasAngleGeometry(plan, angle)) return <>
     <div className="section-heading"><span>Angle measurement</span></div>
     <p className="helper geometry-feedback">This angle is undefined while a connected wall is collapsed. Drag its junctions apart to restore the measurement.</p>
-    <button className="danger-button" onClick={() => {
-      if (commit(p => deleteAngleDimension(p, angle.id))) clear();
-    }}><Trash2 size={15} /> Delete angle measurement</button>
+    <DeleteButton onDelete={onDelete}>Delete angle measurement</DeleteButton>
   </>;
   if (angle) return <>
     <div className="section-heading"><span>Angle measurement</span></div>
@@ -127,9 +139,7 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
       <ArrowLeftRight size={16} /> Measure other side
     </button>
     <details className="property-help"><summary>How angle edits work</summary><p>The first wall and shared corner stay fixed; the second wall rotates without changing its length. Connected walls follow. Double-click the label to edit, or drag the arc to reposition it.</p></details>
-    <button className="danger-button" onClick={() => {
-      if (commit(p => deleteAngleDimension(p, angle.id))) clear();
-    }}><Trash2 size={15} /> Delete angle measurement</button>
+    <DeleteButton onDelete={onDelete}>Delete angle measurement</DeleteButton>
   </>;
   if (wall) {
     const [a, b] = wallPoints(plan, wall);
@@ -155,9 +165,7 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
         onClick={() => commit(p => splitWall(p, wall.id, distance(...wallPoints(p, wall)) / 2))}>
         <CirclePlus size={16} /> Add midpoint node
       </button>
-      <button className="danger-button" onClick={() => {
-        if (commit(p => deleteWall(p, wall.id))) clear();
-      }}><Trash2 size={15} /> Delete wall</button>
+      <DeleteButton onDelete={onDelete}>Delete wall</DeleteButton>
       <details className="property-help"><summary>About this wall</summary><p>Double-click a wall in Select mode to add a node at that position. Length uses the wall centerline. Deleting a wall also removes its openings, angles, and thickness measurements.</p></details>
     </>;
   }
@@ -172,9 +180,7 @@ export default function Properties({ plan, selection, commit, clear, onDeleteNod
       commit(p => updateOpening(p, opening.id, { flip: !opening.flip }))}>
       <ArrowLeftRight size={16} /> Flip door swing
     </button>}
-    <button className="danger-button" onClick={() => {
-      if (commit(p => deleteOpening(p, opening.id))) clear();
-    }}><Trash2 size={15} /> Delete {opening.kind}</button>
+    <DeleteButton onDelete={onDelete}>Delete {opening.kind}</DeleteButton>
   </>;
   if (room) return <>
     <div className="section-heading"><span>Room</span></div>

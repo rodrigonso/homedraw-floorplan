@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { anglePosition } from "./angles";
+import { dimensionPosition } from "./dimensions";
 import { openingPoints } from "./geometryFeedback";
 import {
-  addAngleDimension, addOpening, addRoom, addWall, createEmptyPlan, deleteNode, deleteWall, detectRooms,
-  getGeometryIssues, moveNode, renameRoom, splitWall, validatePlan, type Plan,
+  addAngleDimension, addOpening, addRoom, addWall, createEmptyPlan, deleteAngleDimension, deleteNode,
+  deleteOpening, deleteThicknessDimension, deleteWall, detectRooms,
+  formatLength, getGeometryIssues, moveNode, renameRoom, splitWall, toggleDimension, validatePlan, type Plan,
 } from "./model";
-import { deleteSelection, getMarqueeSelection, moveSelection, selectionBounds, type SelectionItem } from "./selection";
+import { deleteSelection, getMarqueeSelection, getSelectionNodeIds, moveSelection, selectionBounds, type SelectionItem } from "./selection";
 
 const item = (kind: SelectionItem["kind"], id: string): SelectionItem => ({ kind, id });
 const wallItem = item("wall", "horizontal");
@@ -13,6 +15,7 @@ const nodeItem = item("node", "a");
 const doorItem = item("door", "door");
 const windowItem = item("window", "window");
 const angleItem = item("angle", "angle");
+const dimensionItem = item("dimension", "horizontal");
 
 function corner(): Plan {
   return validatePlan({
@@ -164,14 +167,25 @@ describe("marquee selection", () => {
     expect(box(corner(), -100, -100, 4000, 1000)).toEqual([wallItem]);
   });
 
-  it("safely bounds collapsed opening hosts but only marquees visible openings and unavailable angle vertices", () => {
+  it("safely bounds collapsed opening hosts and marquees unavailable angle warning labels", () => {
     const plan = moveNode(corner(), "b", { x: 0, y: 0 });
     expect(selectionBounds(plan, [doorItem])).toEqual({ x: 0, y: 0, width: 0, height: 0 });
-    expect(selectionBounds(plan, [angleItem])).toEqual({ x: 0, y: 0, width: 0, height: 0 });
+    expect(selectionBounds(plan, [angleItem])).toEqual({ x: -680, y: -240, width: 1360, height: 200 });
     expect(box(plan, -1, -1, 1, 1)).not.toContainEqual(doorItem);
-    const short = moveNode(corner(), "b", { x: 0.5, y: 0 });
-    expect(box(short, -0.1, -0.1, 0.1, 0.1)).toContainEqual(angleItem);
-    expect(box(short, -0.1, -0.1, 0.1, 0.1, false)).not.toContainEqual(angleItem);
+    for (const short of [plan, moveNode(corner(), "b", { x: 0.5, y: 0 })]) {
+      expect(box(short, -0.1, -0.1, 0.1, 0.1)).not.toContainEqual(angleItem);
+      expect(box(short, -680, -240, 680, -40)).toEqual([angleItem]);
+      expect(box(short, -680, -240, 680, -40, false)).toEqual([]);
+      expect(selectionBounds(short, [angleItem], false)).toBeNull();
+      for (const coordinates of [
+        [-679.99, -240, 680, -40], [-680, -239.99, 680, -40],
+        [-680, -240, 679.99, -40], [-680, -240, 680, -40.01],
+      ]) {
+        expect(box(short, coordinates[0], coordinates[1], coordinates[2], coordinates[3])).toEqual([]);
+      }
+      expect(deleteSelection(short, [angleItem])).toEqual({ ...short, angleDimensions: [] });
+      expect(() => moveSelection(short, [angleItem], { x: 100, y: 0 })).toThrow(/junctions apart/);
+    }
   });
 
   it("rejects nonfinite marquee coordinates", () => {
@@ -189,6 +203,14 @@ describe("marquee selection", () => {
 });
 
 describe("selection bounds", () => {
+  it("shares the exact moving-node set with translation snapping, without counting attachments twice", () => {
+    expect(new Set(getSelectionNodeIds(corner(), [wallItem, nodeItem, doorItem, angleItem]))).toEqual(new Set(["a", "b"]));
+    expect(getSelectionNodeIds(corner(), [doorItem, angleItem])).toEqual([]);
+    const room = addRoom(createEmptyPlan(), { x: 0, y: 0 }, { x: 4000, y: 3000 }, 150);
+    expect(new Set(getSelectionNodeIds(room, [item("room", detectRooms(room)[0].id)]))).toEqual(new Set(room.nodes.map(node => node.id)));
+    expect(() => getSelectionNodeIds(corner(), [item("node", "missing")])).toThrow(/no longer exists/);
+  });
+
   it("returns null for empty selection and exact wall/node bounds without unrelated bodies", () => {
     expect(selectionBounds(corner(), [])).toBeNull();
     expect(selectionBounds(bareCorner(), [wallItem])).toEqual({ x: 0, y: -100, width: 4000, height: 200 });
@@ -349,6 +371,23 @@ describe("moving a selection", () => {
 });
 
 describe("deleting a selection", () => {
+  it.each([
+    ["node", "a", deleteNode],
+    ["wall", "horizontal", deleteWall],
+    ["door", "door", deleteOpening],
+    ["window", "window", deleteOpening],
+    ["angle", "angle", deleteAngleDimension],
+    ["thickness", "thickness", deleteThicknessDimension],
+    ["dimension", "horizontal", toggleDimension],
+  ] as const)("preserves specialized single-%s deletion on valid plans", (kind, id, remove) => {
+    const plan = validatePlan({
+      ...corner(), thicknessDimensions: [{ id: "thickness", wallId: "horizontal", offset: 350 }],
+    });
+    const snapshot = JSON.stringify(plan);
+    expect(deleteSelection(plan, [item(kind, id)])).toEqual(remove(plan, id));
+    expect(JSON.stringify(plan)).toBe(snapshot);
+  });
+
   it("matches existing single-node deletion exactly and deduplicates selected nodes", () => {
     const plan = corner();
     expect(deleteSelection(plan, [nodeItem])).toEqual(deleteNode(plan, "a"));
@@ -437,9 +476,10 @@ describe("selection reference validation", () => {
     (plan: Plan, items: SelectionItem[]) => selectionBounds(plan, items),
     (plan: Plan, items: SelectionItem[]) => moveSelection(plan, items, { x: 100, y: 100 }),
     (plan: Plan, items: SelectionItem[]) => deleteSelection(plan, items),
+    (plan: Plan, items: SelectionItem[]) => getSelectionNodeIds(plan, items),
   ];
 
-  it.each(["wall", "node", "door", "window", "angle", "room"] as const)(
+  it.each(["wall", "node", "door", "window", "dimension", "angle", "room", "thickness"] as const)(
     "rejects a missing %s before touching any dependency", kind => {
       const plan = corner(), snapshot = JSON.stringify(plan);
       for (const operation of operations) {
@@ -452,5 +492,218 @@ describe("selection reference validation", () => {
   it("rejects mismatched opening roles and stale IDs even for zero movement", () => {
     for (const operation of operations) expect(() => operation(corner(), [item("window", "door")])).toThrow(/window/);
     expect(() => moveSelection(corner(), [item("node", "missing")], { x: 0, y: 0 })).toThrow(/no longer exists/);
+  });
+
+  it("rejects disabled length measurements without treating them as walls", () => {
+    const plan = corner(), hidden = item("dimension", "vertical");
+    for (const operation of operations) {
+      expect(() => operation(plan, [dimensionItem, hidden])).toThrow(/selected dimension.*vertical.*no longer exists/);
+    }
+    expect(() => moveSelection(plan, [hidden], { x: 0, y: 0 })).toThrow(/no longer exists/);
+    expect(() => selectionBounds(plan, [hidden], false)).toThrow(/no longer exists/);
+    expect(() => moveSelection(plan, [item("dimension", "missing")], { x: 0, y: 0 })).toThrow(/no longer exists/);
+  });
+});
+
+describe("independent length measurement selection", () => {
+  it("bounds and marquees the full callout without selecting its host or attached geometry", () => {
+    const plan = corner(), bounds = selectionBounds(plan, [dimensionItem])!;
+    expect(bounds).toEqual({ x: -45, y: -720, width: 4090, height: 520 });
+    expect(box(plan, -45, -720, 4045, -200)).toEqual([dimensionItem]);
+    expect(box(plan, 4045, -200, -45, -720)).toEqual([dimensionItem]);
+    expect(box(plan, -45, -720, 4045, -200, false)).toEqual([]);
+    expect(selectionBounds(plan, [dimensionItem], false)).toBeNull();
+    expect(getSelectionNodeIds(plan, [dimensionItem, dimensionItem])).toEqual([]);
+    expect(getSelectionNodeIds(plan, [dimensionItem, doorItem, angleItem])).toEqual([]);
+    expect(getSelectionNodeIds(plan, [dimensionItem, wallItem])).toEqual(["a", "b"]);
+    expect(selectionBounds(plan, [dimensionItem, dimensionItem])).toEqual(bounds);
+    for (const coordinates of [
+      [-44.99, -720, 4045, -200], [-45, -719.99, 4045, -200],
+      [-45, -720, 4044.99, -200], [-45, -720, 4045, -200.01],
+      [1760, -720, 2240, -480],
+    ]) {
+      expect(box(plan, coordinates[0], coordinates[1], coordinates[2], coordinates[3])).toEqual([]);
+    }
+    expect(box(plan, -100, -800, 4100, 100)).toEqual([wallItem]);
+    const removed = deleteSelection(plan, [dimensionItem]);
+    expect(box(removed, -45, -720, 4045, -200)).toEqual([]);
+  });
+
+  it.each([-600, 0, 600])("bounds signed offset %s using rendered line, ticks, extensions and label", offset => {
+    const plan = validatePlan({
+      ...bareCorner(), walls: bareCorner().walls.map(wall => ({ ...wall, dimensionOffset: offset })),
+    });
+    const bounds = selectionBounds(plan, [dimensionItem])!;
+    expect(bounds).toEqual({
+      x: -45, y: offset < 0 ? offset - 120 : offset === 0 ? -120 : 200,
+      width: 4090, height: offset === 0 ? 240 : 520,
+    });
+    const withWall = selectionBounds(plan, [wallItem, dimensionItem])!;
+    expect(withWall.y).toBeLessThanOrEqual(bounds.y);
+    expect(withWall.y + withWall.height).toBeGreaterThanOrEqual(bounds.y + bounds.height);
+  });
+
+  it("contains rotated callouts rather than only their axis-aligned labels", () => {
+    const plan = moveNode(bareCorner(), "b", { x: 3000, y: 4000 });
+    const bounds = selectionBounds(plan, [dimensionItem])!;
+    expect(bounds).toEqual({ x: 160, y: -425, width: 3384, height: 4305 });
+    expect(box(plan, bounds.x, bounds.y, bounds.x + bounds.width, bounds.y + bounds.height)).toContainEqual(dimensionItem);
+    expect(box(plan, bounds.x + 0.01, bounds.y, bounds.x + bounds.width, bounds.y + bounds.height))
+      .not.toContainEqual(dimensionItem);
+  });
+
+  it.each([
+    { units: "metric", lengthUnits: { metric: "m", imperial: "ft" } },
+    { units: "metric", lengthUnits: { metric: "cm", imperial: "ft" } },
+    { units: "imperial", lengthUnits: { metric: "m", imperial: "ft" } },
+    { units: "imperial", lengthUnits: { metric: "m", imperial: "in" } },
+  ] as const)("uses preferred length units for label bounds (%j)", settings => {
+    const plan = validatePlan({
+      ...bareCorner(), ...settings,
+      nodes: bareCorner().nodes.map(node => node.id === "b" ? { ...node, x: 123.4 } : node),
+    });
+    const halfWidth = Math.max(240, formatLength(123.4, plan).length * 40);
+    const bounds = selectionBounds(plan, [dimensionItem])!;
+    expect(bounds.x).toBeCloseTo(61.7 - halfWidth);
+    expect(bounds.width).toBe(halfWidth * 2);
+    expect(box(plan, bounds.x, bounds.y, bounds.x + bounds.width, bounds.y + bounds.height)).toEqual([dimensionItem]);
+    expect(box(plan, bounds.x, bounds.y, bounds.x + bounds.width - 0.01, bounds.y + bounds.height)).toEqual([]);
+  });
+
+  it("selects and deletes degenerate warning labels, but rejects movement without a normal", () => {
+    for (const length of [0, 0.5]) {
+      const plan = moveNode(corner(), "b", { x: length, y: 0 });
+      const bounds = selectionBounds(plan, [dimensionItem])!;
+      expect(bounds).toEqual({
+        x: -formatLength(length, plan).length * 40, y: 160,
+        width: formatLength(length, plan).length * 80, height: 200,
+      });
+      expect(box(plan, bounds.x, 160, bounds.x + bounds.width, 360)).toEqual([dimensionItem]);
+      expect(box(plan, bounds.x, 160, bounds.x + bounds.width, 360, false)).toEqual([]);
+      expect(() => moveSelection(plan, [dimensionItem], { x: 100, y: 0 })).toThrow(/junctions apart.*dimension/);
+      const deleted = deleteSelection(plan, [dimensionItem]);
+      expect(deleted).toEqual({ ...plan, walls: [{ ...plan.walls[0], dimension: false }, plan.walls[1]] });
+      const repaired = moveSelection(plan, [item("node", "b"), dimensionItem], { x: 4000 - length, y: 0 });
+      expect(repaired).toEqual(corner());
+    }
+  });
+
+  it("moves only offsets along each host normal, deduplicating selected measurements", () => {
+    const plan = validatePlan({ ...corner(), walls: corner().walls.map(wall => ({
+      ...wall, dimension: true, dimensionOffset: -600,
+    })) }), snapshot = JSON.stringify(plan);
+    const next = moveSelection(plan, [dimensionItem, item("dimension", "vertical"), dimensionItem], { x: 100, y: 200 });
+    expect(next).toEqual({ ...plan, walls: [
+      { ...plan.walls[0], dimensionOffset: -400 }, { ...plan.walls[1], dimensionOffset: -700 },
+    ] });
+    expect(moveSelection(plan, [dimensionItem], { x: 50, y: 800 }).walls[0].dimensionOffset).toBe(200);
+    const rotated = moveNode(plan, "b", { x: 3000, y: 4000 });
+    expect(moveSelection(rotated, [dimensionItem], { x: 100, y: 200 }).walls[0].dimensionOffset).toBeCloseTo(-560);
+    const reversed = validatePlan({ ...plan, walls: plan.walls.map(wall => ({ ...wall, a: wall.b, b: wall.a })) });
+    expect(moveSelection(reversed, [dimensionItem], { x: 100, y: 200 }).walls[0].dimensionOffset).toBe(-800);
+    expect(JSON.stringify(plan)).toBe(snapshot);
+  });
+
+  it("retains implicit default placement and optional fields until an actual normal movement", () => {
+    let plan = addWall(createEmptyPlan(), { x: 0, y: 0 }, { x: 4000, y: 0 }, 200);
+    plan = addOpening(plan, plan.walls[0].id, "door", 2000, 800);
+    const dimension = item("dimension", plan.walls[0].id), wall = plan.walls[0];
+    const offset = dimensionPosition(plan, wall).offset;
+    for (const delta of [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 0, y: 1e-7 }]) {
+      expect(moveSelection(plan, [dimension], delta)).toBe(plan);
+    }
+    const tangent = moveSelection(plan, [dimension, item("door", plan.openings[0].id)], { x: 100, y: 0 });
+    expect(tangent.walls[0]).not.toHaveProperty("dimensionOffset");
+    const moved = moveSelection(plan, [dimension], { x: 100, y: -100 });
+    expect(moved.walls[0]).toEqual({ ...wall, dimensionOffset: offset - 100 });
+    expect(moved).not.toHaveProperty("angleDimensions");
+    expect(moved).not.toHaveProperty("thicknessDimensions");
+    expect(plan.walls[0]).not.toHaveProperty("dimensionOffset");
+  });
+
+  it("does not move a measurement twice when a host, connected wall, endpoint or room moves", () => {
+    const plan = corner(), delta = { x: 150, y: -250 };
+    for (const host of [wallItem, nodeItem, item("node", "b"), item("wall", "vertical")]) {
+      expect(moveSelection(plan, [host, dimensionItem], delta)).toEqual(moveSelection(plan, [host], delta));
+    }
+    const room = addRoom(createEmptyPlan(), { x: 0, y: 0 }, { x: 4000, y: 3000 }, 150);
+    const roomItem = item("room", detectRooms(room)[0].id);
+    expect(moveSelection(room, [roomItem, ...room.walls.map(wall => item("dimension", wall.id))], delta))
+      .toEqual(moveSelection(room, [roomItem], delta));
+  });
+
+  it.each([-1, 1])("validates offset limits atomically, including sub-epsilon overflow with sign %s", sign => {
+    const plan = validatePlan({ ...corner(), walls: corner().walls.map(wall => ({
+      ...wall, dimensionOffset: sign * 100000,
+    })) }), snapshot = JSON.stringify(plan);
+    expect(() => moveSelection(plan, [dimensionItem], { x: 0, y: sign * 1e-7 })).toThrow(/Dimension offset.*100 m/);
+    expect(() => moveSelection(plan, [doorItem, dimensionItem], { x: 100, y: sign })).toThrow(/Dimension offset/);
+    expect(() => moveSelection(plan, [dimensionItem], { x: NaN, y: 0 })).toThrow(/finite/);
+    expect(() => moveSelection(plan, [dimensionItem], { x: 0, y: Infinity })).toThrow(/finite/);
+    expect(JSON.stringify(plan)).toBe(snapshot);
+  });
+
+  it("deletes only the selected length label while preserving room and annotation dependencies", () => {
+    let plan = addRoom(createEmptyPlan(), { x: 0, y: 0 }, { x: 4000, y: 3000 }, 150);
+    plan = renameRoom(plan, detectRooms(plan)[0].id, "Workshop");
+    plan = addOpening(plan, plan.walls[0].id, "door", 2000, 800);
+    plan = addAngleDimension(plan, {
+      wallA: plan.walls[0].id, wallB: plan.walls[1].id, vertex: plan.walls[0].b, radius: 500, clockwise: true,
+    });
+    plan = validatePlan({
+      ...plan, thicknessDimensions: [{ id: "thickness", wallId: plan.walls[0].id, offset: 350 }],
+    });
+    for (const offset of [undefined, -600, 0, 600]) {
+      const original = validatePlan({ ...plan, walls: plan.walls.map((wall, index) =>
+        index === 0 && offset !== undefined ? { ...wall, dimensionOffset: offset } : wall) });
+      const snapshot = JSON.stringify(original), selected = item("dimension", original.walls[0].id);
+      const next = deleteSelection(original, [selected, selected]);
+      expect(next).toEqual({
+        ...original, walls: original.walls.map((wall, index) => index === 0 ? { ...wall, dimension: false } : wall),
+      });
+      expect(detectRooms(next)).toEqual(detectRooms(original));
+      if (offset === undefined) expect(next.walls[0]).not.toHaveProperty("dimensionOffset");
+      const restored = validatePlan({ ...next, walls: next.walls.map(wall => ({ ...wall, dimension: true })) });
+      expect(dimensionPosition(restored, restored.walls[0])).toEqual(dimensionPosition(original, original.walls[0]));
+      expect(JSON.stringify(original)).toBe(snapshot);
+    }
+  });
+
+  it("deletes multiple length, angle and thickness measurements independently in any item order", () => {
+    const plan = validatePlan({
+      ...corner(), walls: corner().walls.map(wall => ({ ...wall, dimension: true })),
+      thicknessDimensions: [
+        { id: "thickness", wallId: "horizontal", offset: 350 }, { id: "other-thickness", wallId: "vertical", offset: -500 },
+      ],
+    });
+    const dimensions = [dimensionItem, item("dimension", "vertical"), dimensionItem];
+    const withoutLengths = { ...plan, walls: plan.walls.map(wall => ({ ...wall, dimension: false })) };
+    expect(deleteSelection(plan, dimensions)).toEqual(withoutLengths);
+    const mixed = [...dimensions, angleItem, item("thickness", "thickness")];
+    const expected = { ...withoutLengths, angleDimensions: [], thicknessDimensions: [plan.thicknessDimensions![1]] };
+    expect(deleteSelection(plan, mixed)).toEqual(expected);
+    expect(deleteSelection(plan, [...mixed].reverse())).toEqual(expected);
+    expect(deleteSelection(corner(), [wallItem, dimensionItem])).toEqual(deleteSelection(corner(), [wallItem]));
+    expect(deleteSelection(corner(), [dimensionItem, wallItem, nodeItem])).toEqual(deleteSelection(corner(), [wallItem]));
+  });
+
+  it("applies dimension removals before existing deterministic node-join topology", () => {
+    const plan = validatePlan({ ...corner(), walls: corner().walls.map(wall => ({ ...wall, dimension: true })) });
+    for (const dimensions of [[dimensionItem], [dimensionItem, item("dimension", "vertical")]]) {
+      const expected = deleteNode(deleteSelection(plan, dimensions), "a");
+      expect(deleteSelection(plan, [nodeItem, ...dimensions])).toEqual(expected);
+      expect(deleteSelection(plan, [...dimensions].reverse().concat(nodeItem))).toEqual(expected);
+      expect(expected.walls[0].dimension).toBe(dimensions.length === 1);
+    }
+  });
+
+  it("never silently prunes unrelated orphan nodes when deleting annotations or walls", () => {
+    const plan = { ...corner(), nodes: [...corner().nodes, { id: "orphan", x: 5000, y: 5000 }] };
+    const snapshot = JSON.stringify(plan);
+    // Orphans violate the schema: deletion must reject them rather than silently repair unrelated geometry.
+    for (const selected of [dimensionItem, angleItem, doorItem, wallItem]) {
+      expect(() => deleteSelection(plan, [selected])).toThrow(/unused junctions/);
+    }
+    expect(JSON.stringify(plan)).toBe(snapshot);
   });
 });

@@ -4,22 +4,26 @@ import { palette } from "../src/theme";
 
 const rgb = (hex: string) => `rgb(${[1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16)).join(", ")})`;
 
-test("room fills and area values share the accent on the canvas, in properties and in export elements", async ({ page }) => {
+test("rooms retain accent fills and property details without automatic canvas or export labels", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("status", { name: "Saved on this device", exact: true })).toBeVisible();
   const rooms = await page.evaluate(async () => {
     const path = "/src/scene.ts";
     const scene: typeof import("../src/scene") = await import(path);
     const plan: Plan = JSON.parse(localStorage.getItem("homedraw.project.v1")!).plan;
-    const elements = scene.planToElements(plan);
-    return {
+    const renderer = scene.createPlanRenderer();
+    return [renderer.render(plan), scene.planToElements(plan), renderer.render(plan, false), scene.planToElements(plan, false)].map(elements => ({
       fills: elements.filter(element => element.id.startsWith("plan-room-")).map(element => element.backgroundColor),
-      areas: elements.filter(element => element.id.startsWith("plan-area-")).map(element => element.strokeColor),
-    };
+      labels: elements.filter(element => /^plan-(name|area)-/.test(element.id)).map(element => element.id),
+    }));
   });
-  expect(rooms.fills).toEqual([palette.accentSoft, palette.accentSoft]);
-  expect(rooms.areas).toEqual([palette.accentText, palette.accentText]);
+  for (const room of rooms) {
+    expect(room.fills).toEqual([palette.accentSoft, palette.accentSoft]);
+    expect(room.labels).toEqual([]);
+  }
   await page.locator(".rooms-menu > summary").click();
+  await expect(page.locator(".room-list button")).toHaveCount(2);
+  await expect(page.getByRole("button", { name: /Kitchen/ })).toBeVisible();
   await expect(page.locator(".plan-summary .area-value")).toHaveCSS("color", rgb(palette.accentText));
   for (const dot of await page.locator(".room-dot").all()) {
     await expect(dot).toHaveCSS("background-color", rgb(palette.accentSoft));
@@ -28,11 +32,66 @@ test("room fills and area values share the accent on the canvas, in properties a
     await expect(area).toHaveCSS("color", rgb(palette.accentText));
   }
   await page.getByRole("button", { name: /Living room/ }).click();
+  await expect(page.getByRole("textbox", { name: "Room name", exact: true })).toHaveValue("Living room");
   await expect(page.locator(".room-area")).toHaveCSS("background-color", rgb(palette.accentSoft));
   await expect(page.locator(".room-area .area-value")).toHaveCSS("color", rgb(palette.accentText));
 });
 
-test("draft controls, focus, selections and native sketch controls share the accent palette", async ({ page }) => {
+test("SVG and PNG exports omit automatic room text while preserving user-created text", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("status", { name: "Saved on this device", exact: true })).toBeVisible();
+  const { project, roomLabels } = await page.evaluate(async () => {
+    const modelPath = "/src/model.ts";
+    const model: typeof import("../src/model") = await import(modelPath);
+    const project = JSON.parse(localStorage.getItem("homedraw.project.v1")!);
+    project.sketches = [{
+      id: "manual-room-note", type: "text", x: 100, y: 100, width: 200, height: 25,
+      text: "Keep this custom label", fontSize: 20, fontFamily: 5, strokeColor: "#252422",
+    }];
+    return {
+      project,
+      roomLabels: model.detectRooms(project.plan).flatMap(room => [room.name, model.formatArea(room.area, project.plan.units)]),
+    };
+  });
+  await page.addInitScript(project => localStorage.setItem("homedraw.project.v1", JSON.stringify(project)), project);
+  await page.reload();
+  await expect(page.getByRole("status", { name: "Saved on this device", exact: true })).toBeVisible();
+  const originalNotes = await page.evaluate(() => JSON.parse(localStorage.getItem("homedraw.project.v1")!).sketches);
+  expect(originalNotes).toEqual([expect.objectContaining({ id: "manual-room-note", text: "Keep this custom label" })]);
+  await page.locator(".export-menu > summary").click();
+  const svgDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "SVG drawing", exact: true }).click();
+  const svgChunks: Buffer[] = [];
+  for await (const chunk of (await (await svgDownload).createReadStream())!) svgChunks.push(Buffer.from(chunk));
+  const svg = Buffer.concat(svgChunks).toString();
+  expect(svg).toContain("Keep this custom label");
+  for (const label of roomLabels) expect(svg).not.toContain(`>${label}</text>`);
+  expect(svg).toContain(palette.accentSoft);
+  const readExportedText = await page.evaluateHandle(() => {
+    const text: string[] = [];
+    const fillText = CanvasRenderingContext2D.prototype.fillText;
+    CanvasRenderingContext2D.prototype.fillText = function (...args) {
+      text.push(args[0]);
+      return fillText.apply(this, args);
+    };
+    return () => {
+      CanvasRenderingContext2D.prototype.fillText = fillText;
+      return text;
+    };
+  });
+  const pngDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "PNG image", exact: true }).click();
+  const pngChunks: Buffer[] = [];
+  for await (const chunk of (await (await pngDownload).createReadStream())!) pngChunks.push(Buffer.from(chunk));
+  expect(Buffer.concat(pngChunks).subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+  const renderedText = await readExportedText.evaluate(read => read());
+  await readExportedText.dispose();
+  expect(renderedText).toContain("Keep this custom label");
+  for (const label of roomLabels) expect(renderedText).not.toContain(label);
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem("homedraw.project.v1")!).sketches)).toEqual(originalNotes);
+});
+
+test("draft controls, focus, selections and renovation notes share the accent palette", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("status", { name: "Saved on this device", exact: true })).toHaveCSS("color", rgb(palette.accent));
   const selected = page.getByRole("button", { name: "Select tool", exact: true });
@@ -59,29 +118,23 @@ test("draft controls, focus, selections and native sketch controls share the acc
   await primary.hover();
   await expect(primary).toHaveCSS("background-color", rgb(palette.accentHover));
   await primary.click();
-  await page.getByRole("button", { name: "Sketch & annotate", exact: true }).click();
-  const nativeSelected = page.locator(".excalidraw .ToolIcon_type_radio:checked + .ToolIcon__icon").first();
-  await expect(nativeSelected).toHaveCSS("background-color", rgb(palette.accentSoft));
-  await expect(nativeSelected.locator("svg")).toHaveCSS("color", rgb(palette.accentText));
+  await page.getByRole("button", { name: "Renovation notes", exact: true }).click();
+  const noteTool = page.getByRole("button", { name: "Draw note", exact: true });
+  await expect(noteTool).toHaveCSS("background-color", rgb(palette.accentSoft));
+  await expect(noteTool).toHaveCSS("color", rgb(palette.accentText));
   const nativePrimary = await page.locator(".excalidraw").evaluate(element =>
     getComputedStyle(element).getPropertyValue("--color-primary").trim());
   expect(nativePrimary).toBe(palette.accent);
-  await page.getByTestId("main-menu-trigger").click();
-  await page.getByTestId("help-menu-item").click();
-  const nativeDialog = page.locator(".excalidraw-modal-container");
-  await expect(nativeDialog).toBeVisible();
-  expect(await nativeDialog.evaluate(element =>
-    getComputedStyle(element).getPropertyValue("--color-surface-primary-container").trim())).toBe(palette.accentSoft);
-  expect(await nativeDialog.evaluate(element =>
-    getComputedStyle(element).getPropertyValue("--color-on-primary-container").trim())).toBe(palette.accentText);
-  await page.locator(".HelpDialog .Modal__background").click({ position: { x: 5, y: 5 } });
-  await expect(nativeDialog).toHaveCount(0);
+  await expect(page.getByTestId("main-menu-trigger")).not.toBeVisible();
+  await page.getByRole("button", { name: "Quick guide", exact: true }).click();
+  await expect(page.getByRole("button", { name: "Got it", exact: true })).toHaveCSS("background-color", rgb(palette.accent));
+  await page.getByRole("button", { name: "Got it", exact: true }).click();
   await page.mouse.move(140, 840);
   await page.mouse.down();
   await page.mouse.move(200, 810, { steps: 8 });
   await page.mouse.move(260, 840, { steps: 8 });
   await page.mouse.up();
-  await page.getByRole("button", { name: "Done sketching", exact: true }).click();
+  await page.getByRole("button", { name: "Done notes", exact: true }).click();
   await expect(page.getByRole("status", { name: "Saved on this device", exact: true })).toBeVisible();
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem("homedraw.project.v1")!).sketches.at(-1).strokeColor))
     .toBe(palette.ink);

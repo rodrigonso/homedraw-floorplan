@@ -1,7 +1,7 @@
 import { convertToExcalidrawElements } from "@excalidraw/excalidraw";
 import type { ExcalidrawElement } from "@excalidraw/excalidraw/element/types";
 import {
-  detectRooms, distance, formatArea, formatLength, getGeometryIssues, isWallDegenerate, projectToWall, wallPoints,
+  detectRooms, distance, formatLength, getGeometryIssues, isWallDegenerate, projectToWall, wallPoints,
   type GeometryIssue, type Plan, type Point, type Room,
 } from "./model";
 import { wallGeometry } from "./wallGeometry";
@@ -13,7 +13,7 @@ import { palette } from "./theme";
 import type { SelectionItem } from "./selection";
 
 export const SCALE = 0.1;
-export const PAPER = "#ffffff";
+const PAPER = "#ffffff";
 export type Selection = SelectionItem | null;
 export type DimensionPreview = { id: string; offset: number; measurement?: "thickness" };
 
@@ -41,6 +41,15 @@ function planToShapes(plan: Plan, showDimensions = true, dimensionPreview?: Dime
       ...base(id), type: "text", x: point.x * SCALE, y: point.y * SCALE,
       text, fontSize, fontFamily: 5, strokeColor: color, textAlign: "center",
     });
+  };
+  const measurementLabel = (kind: string, id: string, point: Point, text: string, minimumWidth: number) => {
+    const width = Math.max(minimumWidth, text.length * 8);
+    shapes.push({
+      ...base(`${kind}-bg-${id}`), type: "rectangle",
+      x: point.x * SCALE - width / 2, y: point.y * SCALE - 12,
+      width, height: 24, backgroundColor: PAPER, strokeColor: "transparent", fillStyle: "solid",
+    });
+    label(`${kind}-label-${id}`, { x: point.x, y: point.y - 95 }, text, 14, palette.accentText);
   };
   const rooms = detectRooms(plan, issues);
   rooms.forEach(room => {
@@ -85,10 +94,6 @@ function planToShapes(plan: Plan, showDimensions = true, dimensionPreview?: Dime
       line(`swing-${opening.id}`, arc, palette.softInk, 0.9);
     }
   });
-  rooms.forEach(room => {
-    label(`name-${room.id}`, { x: room.center.x, y: room.center.y - 170 }, room.name, 23, palette.ink);
-    label(`area-${room.id}`, { x: room.center.x, y: room.center.y + 160 }, formatArea(room.area, plan.units), 14, palette.accentText);
-  });
   if (showDimensions) plan.walls.filter(w => w.dimension).forEach(wall => {
     const [a, b] = wallPoints(plan, wall);
     if (isWallDegenerate(plan, wall)) {
@@ -98,25 +103,11 @@ function planToShapes(plan: Plan, showDimensions = true, dimensionPreview?: Dime
     const dim = dimensionPosition(plan, dimensionPreview?.measurement !== "thickness" && dimensionPreview?.id === wall.id
       ? { ...wall, dimensionOffset: dimensionPreview.offset } : wall);
     line(`dim-${wall.id}`, [dim.a, dim.b], palette.accent, 0.7, "transparent", 0.65, 65);
-    [a, b].forEach((point, i) => {
-      const end = i === 0 ? dim.a : dim.b;
-      const gap = Math.min(wall.thickness / 2 + 100, Math.abs(dim.offset));
-      line(`ext-${wall.id}-${i}`, [
-        { x: point.x + dim.normal.x * gap, y: point.y + dim.normal.y * gap },
-        { x: end.x + dim.normal.x * 80, y: end.y + dim.normal.y * 80 },
-      ], palette.accent, 0.6, "transparent", 0.65, 35);
-      line(`tick-${wall.id}-${i}`, [
-        { x: end.x - 45, y: end.y + 65 }, { x: end.x + 45, y: end.y - 65 },
-      ], palette.accent, 1, "transparent", 0.65, 85);
+    dim.extensions.forEach((points, i) => {
+      line(`ext-${wall.id}-${i}`, points, palette.accent, 0.6, "transparent", 0.65, 35);
+      line(`tick-${wall.id}-${i}`, dim.ticks[i], palette.accent, 1, "transparent", 0.65, 85);
     });
-    const text = formatLength(distance(a, b), plan);
-    const width = Math.max(48, text.length * 8);
-    shapes.push({
-      ...base(`dim-bg-${wall.id}`), type: "rectangle",
-      x: dim.label.x * SCALE - width / 2, y: dim.label.y * SCALE - 12,
-      width, height: 24, backgroundColor: PAPER, strokeColor: "transparent", fillStyle: "solid",
-    });
-    label(`dim-label-${wall.id}`, { x: dim.label.x, y: dim.label.y - 95 }, text, 14, palette.accentText);
+    measurementLabel("dim", wall.id, dim.label, formatLength(distance(a, b), plan), 48);
   });
   if (showDimensions) plan.thicknessDimensions?.forEach(dimension => {
     const wall = plan.walls.find(wall => wall.id === dimension.wallId)!;
@@ -132,13 +123,7 @@ function planToShapes(plan: Plan, showDimensions = true, dimensionPreview?: Dime
     dim.extensions.forEach((points, i) => line(`thickness-ext-${dimension.id}-${i}`, points, palette.accent, 0.6, "transparent", 0.65, 35));
     dim.ticks.forEach((points, i) => line(`thickness-tick-${dimension.id}-${i}`, points, palette.accent, 1, "transparent", 0.65, 85));
     line(`thickness-leader-${dimension.id}`, [dim.b, dim.label], palette.accent, 0.6, "transparent", 0.25, 50);
-    const width = Math.max(56, text.length * 8);
-    shapes.push({
-      ...base(`thickness-bg-${dimension.id}`), type: "rectangle",
-      x: dim.label.x * SCALE - width / 2, y: dim.label.y * SCALE - 12,
-      width, height: 24, backgroundColor: PAPER, strokeColor: "transparent", fillStyle: "solid",
-    });
-    label(`thickness-label-${dimension.id}`, { x: dim.label.x, y: dim.label.y - 95 }, text, 14, palette.accentText);
+    measurementLabel("thickness", dimension.id, dim.label, text, 56);
   });
   if (showDimensions) plan.angleDimensions?.forEach(dimension => {
     if (!hasAngleGeometry(plan, dimension)) {
@@ -150,14 +135,7 @@ function planToShapes(plan: Plan, showDimensions = true, dimensionPreview?: Dime
     line(`angle-arc-${dimension.id}`, angle.arc, palette.accent, 0.9, "transparent", 0.25, 65);
     angle.extensions.forEach((points, i) => line(`angle-ext-${dimension.id}-${i}`, points, palette.accent, 0.6, "transparent", 0.65, 35));
     angle.ticks.forEach((points, i) => line(`angle-tick-${dimension.id}-${i}`, points, palette.accent, 1, "transparent", 0.65, 85));
-    const text = formatAngle(angle.degrees);
-    const width = Math.max(40, text.length * 8);
-    shapes.push({
-      ...base(`angle-bg-${dimension.id}`), type: "rectangle",
-      x: angle.label.x * SCALE - width / 2, y: angle.label.y * SCALE - 12,
-      width, height: 24, backgroundColor: PAPER, strokeColor: "transparent", fillStyle: "solid",
-    });
-    label(`angle-label-${dimension.id}`, { x: angle.label.x, y: angle.label.y - 95 }, text, 14, palette.accentText);
+    measurementLabel("angle", dimension.id, angle.label, formatAngle(angle.degrees), 40);
   });
   for (const highlight of geometryHighlights(plan, issues)) {
     const id = `warning-${highlight.kind}-${highlight.id}`;
@@ -191,7 +169,7 @@ export function createPlanRenderer() {
 
 export const isPlanElement = (element: ExcalidrawElement) => element.customData?.homedraw === true;
 
-export function containsPoint(room: Room, point: Point) {
+function containsPoint(room: Room, point: Point) {
   let inside = false;
   for (let i = 0, j = room.points.length - 1; i < room.points.length; j = i++) {
     const a = room.points[i], b = room.points[j];
@@ -216,9 +194,13 @@ export function hitTest(plan: Plan, point: Point, threshold: number, showDimensi
       return !isWallDegenerate(plan, wall) && distance(point, thicknessDimensionPosition(plan, dimension).label) < threshold * 2;
     });
     if (thickness) return { kind: "thickness", id: thickness.id };
-    const wall = plan.walls.find(w => w.dimension && !isWallDegenerate(plan, w)
-      && distance(point, dimensionPosition(plan, w).label) < threshold * 2);
-    if (wall) return { kind: "wall", id: wall.id };
+    const wall = plan.walls.find(wall => {
+      if (!wall.dimension) return false;
+      const [a] = wallPoints(plan, wall);
+      const label = isWallDegenerate(plan, wall) ? { x: a.x, y: a.y + 160 } : dimensionPosition(plan, wall).label;
+      return distance(point, label) < threshold * 2;
+    });
+    if (wall) return { kind: "dimension", id: wall.id };
   }
   const opening = [...plan.openings].reverse().find(opening => {
     const points = openingPoints(plan, opening);

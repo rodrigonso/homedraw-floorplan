@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { constrainToAxis, createEmptyPlan, snapPoint } from "./model";
+import { constrainToAxis, createEmptyPlan } from "./model";
+import { snapDraftPoint } from "./snapGuides";
 
 describe("right-angle constraints", () => {
   it.each([
@@ -15,7 +16,7 @@ describe("right-angle constraints", () => {
   it("does not quantize or clamp a constrained position", () => {
     expect(constrainToAxis({ x: 277.25, y: 173.5 }, { x: 0, y: 0 })).toEqual({ x: 277.25, y: 0 });
     expect(constrainToAxis({ x: 100000, y: 400 }, { x: -100000, y: 0 })).toEqual({ x: 100000, y: 0 });
-    expect(snapPoint(createEmptyPlan(), { x: 373, y: 110 }, 0, 0, { x: 25, y: 35 }, true)).toEqual({ x: 373, y: 35 });
+    expect(snapDraftPoint(createEmptyPlan(), { x: 373, y: 110 }, 0, 0, { x: 25, y: 35 }, true).point).toEqual({ x: 373, y: 35 });
   });
 
   it.each([NaN, Infinity, -Infinity])("rejects nonfinite coordinates (%s)", value => {

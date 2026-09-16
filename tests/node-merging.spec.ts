@@ -75,12 +75,15 @@ for (const width of [1440, 390]) test(`dropping a node combines junctions and cl
   expect(await savedPlan(page)).toEqual(merged);
   await page.reload();
   expect(await savedPlan(page)).toEqual(merged);
+  await page.keyboard.down("Alt");
   await begin(page, { x: 0, y: 0 });
   const moved = await screen(page, { x: -300, y: -200 });
   await page.mouse.move(moved.x, moved.y, { steps: 8 });
   await page.mouse.up();
+  await page.keyboard.up("Alt");
   const reshaped = await savedPlan(page);
-  expect(reshaped.nodes.find(node => node.id === "a")).toMatchObject({ x: -300, y: -200 });
+  expect(reshaped.nodes.find(node => node.id === "a")!.x).toBeCloseTo(-300, 3);
+  expect(reshaped.nodes.find(node => node.id === "a")!.y).toBeCloseTo(-200, 3);
   expect(reshaped.nodes.filter(node => node.id !== "a")).toEqual(merged.nodes.filter(node => node.id !== "a"));
   expect(reshaped.walls.filter(wall => wall.a === "a" || wall.b === "a")).toHaveLength(2);
   await page.getByRole("button", { name: "Undo", exact: true }).click();

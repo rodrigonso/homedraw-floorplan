@@ -21,6 +21,14 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
+## Deployment
+
+The public repository is [rodrigonso/homedraw-floorplan](https://github.com/rodrigonso/homedraw-floorplan), connected to the Vercel project `homedraw-floorplan`. Pushes to `master` deploy production; pull requests receive preview deployments.
+
+`vercel.json` uses npm's lockfile and runs the full build, including local canvas-font preparation and TypeScript checks. The output is the static `dist` directory, with no backend or application environment variables required. Local Vercel link metadata is ignored by Git.
+
+Floor plans remain in each browser's local storage. Use project export/import to transfer plans between localhost, preview deployments, and the production site.
+
 ## Editor layout
 
 The canvas fills the window, with a minimal floating tool strip and compact zoom and undo controls. Hover a tool for its name and shortcut. Properties appear only for the current selection or drawing tool; opening them does not shift the canvas.
